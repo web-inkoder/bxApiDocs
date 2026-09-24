@@ -9,6 +9,7 @@ use Bitrix\Market\Application\Installed;
 use Bitrix\Market\Application\License;
 use Bitrix\Market\Application\MarketDetail;
 use Bitrix\Market\Application\Rights;
+use Bitrix\Market\Application\VibePlusApplicationLimit;
 use Bitrix\Market\Application\Versions;
 use Bitrix\Market\Detail\DetailType;
 use Bitrix\Market\Menu;
@@ -17,6 +18,7 @@ use Bitrix\Rest\AppTable;
 use Bitrix\Rest\Engine\Access;
 use Bitrix\Rest\Marketplace\Client;
 use Bitrix\Rest\Marketplace\Url;
+use Bitrix\Rest\Service\ServiceContainer;
 use Bitrix\Market\Internal;
 use Bitrix\Market\Loadable;
 
@@ -29,6 +31,8 @@ Loader::includeModule('market');
 
 class RestMarketDetail extends CBitrixComponent implements Loadable
 {
+	private const MARKET_APPLICATION_LIMIT_HELPER_CODE = 'limit_free_rest_hold';
+
 	private array $appItem;
 	private int $version = 0;
 	private Internal\Integration\Rest\Client $restClient;
@@ -84,6 +88,8 @@ class RestMarketDetail extends CBitrixComponent implements Loadable
 	private function loadDetailResult(): void
 	{
 		$this->prepareInfo();
+		$this->arResult['VIBE_PLUS_APPLICATION_LIMIT'] = (new VibePlusApplicationLimit())->getProjection();
+
 		$marketDetail = new MarketDetail($this->arParams['APP_CODE'], DetailType::App);
 		$marketDetail->setVersion($this->version);
 		$marketDetail->setCheckHash($this->arResult['CHECK_HASH']);
@@ -101,9 +107,12 @@ class RestMarketDetail extends CBitrixComponent implements Loadable
 		$this->restClient->connectToMarket();
 
 		$this->arParams['COMPONENT_NAME'] = 'bitrix:market.detail';
+		$this->appItem = Installed::getByCode($this->arParams['APP_CODE']);
+		$appClientId = (string)($this->appItem['CLIENT_ID'] ?? '');
+		$appAccessIdentifier = $appClientId !== '' ? $appClientId : $this->arParams['APP_CODE'];
 
 		$this->arResult['REST_ACCESS'] =
-			Access::isAvailable($this->arParams['APP_CODE'])
+			Access::isAvailable($appAccessIdentifier)
 			&& Access::isAvailableCount(Access::ENTITY_TYPE_APP, $this->arParams['APP_CODE'])
 		;
 
@@ -132,8 +141,6 @@ class RestMarketDetail extends CBitrixComponent implements Loadable
 				$this->arResult['INSTALL_HASH'] = $installHash;
 			}
 		}
-
-		$this->appItem = Installed::getByCode($this->arParams['APP_CODE']);
 
 		if ($this->appItem['ACTIVE'] === AppTable::ACTIVE)
 		{
@@ -208,11 +215,21 @@ class RestMarketDetail extends CBitrixComponent implements Loadable
 			isset($this->arResult['APP']['BY_SUBSCRIPTION'])
 			&& $this->arResult['APP']['BY_SUBSCRIPTION'] === 'Y'
 		;
+		$isTariffApplicationLimit = ServiceContainer::getInstance()
+			->getVibePlusTariffAccessService()
+			->getMarketApplicationLimit() !== null
+		;
+		$canInstallApp = $this->isAppInstalled() || Access::canInstallApp($this->arResult['APP']);
 
 		if (
-			!$this->arResult['REST_ACCESS']
-			&& !Access::isAllowFreeApp($this->arResult['APP'])
-			|| ($appBySubscription && !Client::isSubscriptionAvailable())
+			!$isTariffApplicationLimit
+			&& (
+				(
+					!$this->arResult['REST_ACCESS']
+					&& !Access::isAllowFreeApp($this->arResult['APP'])
+				)
+				|| ($appBySubscription && !Client::isSubscriptionAvailable())
+			)
 		)
 		{
 			$this->arResult['ACCESS_HELPER_CODE'] = Access::getHelperCode(
@@ -220,6 +237,15 @@ class RestMarketDetail extends CBitrixComponent implements Loadable
 				Access::ENTITY_TYPE_APP,
 				$this->arResult['APP']
 			);
+		}
+
+		if (
+			$this->arResult['ACCESS_HELPER_CODE'] === ''
+			&& !$this->isAppInstalled()
+			&& !$canInstallApp
+		)
+		{
+			$this->arResult['ACCESS_HELPER_CODE'] = self::MARKET_APPLICATION_LIMIT_HELPER_CODE;
 		}
 
 		$this->arResult['PRICE_POLICY_SLIDER'] = $appBySubscription ? Status::getSlider() : '';

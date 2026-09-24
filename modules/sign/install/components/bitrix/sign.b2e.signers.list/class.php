@@ -38,8 +38,9 @@ final class SignB2eSignersList extends SignBaseComponent
 	// No typed field plus the stable ID DESC the domain applies anyway.
 	private const DEFAULT_DATA_ORDER = [null, Order::Desc];
 
-	// JS variable of the grid controller: action handlers are evaluated in the page scope.
-	private const CLIENT_CONTROLLER = 'listGrid';
+	// Path to the single instance of the grid controller: the grid evaluates action handlers
+	// outside the scope of the page, so no name declared by the page template may be used.
+	private const CLIENT_CONTROLLER = 'BX.Sign.V2.Grid.B2e.Signers.getInstance()';
 
 	private readonly \Bitrix\Sign\Service\SignersListService $signersListService;
 	private readonly UserRepository $userRepository;
@@ -356,8 +357,10 @@ final class SignB2eSignersList extends SignBaseComponent
 	}
 
 	/**
-	 * main.ui.grid evaluates a cell action handler as an expression and expects a function, hence bind().
-	 * No user-controlled value may be interpolated into that expression.
+	 * main.ui.grid evaluates a cell action handler as an expression in the row constructor and expects
+	 * a function, hence the wrapper: the namespace of the extension is reached on click, not while the
+	 * expression is evaluated. The grid calls the result with the event as its first argument
+	 * (main.ui.grid row.js, preparedHandler.bind). No user-controlled value may be interpolated here.
 	 *
 	 * @return array<string, list<array<string, mixed>>>
 	 */
@@ -388,7 +391,7 @@ final class SignB2eSignersList extends SignBaseComponent
 					],
 					'events' => [
 						'click' => sprintf(
-							'%1$s.togglePin.bind(%1$s, %2$d, %3$s)',
+							'(event) => %s.togglePin(%d, %s, event)',
 							$controller,
 							$listId,
 							$isPinned ? 'true' : 'false',

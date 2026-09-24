@@ -1,9 +1,11 @@
 <?php
 
+use Bitrix\Disk\Document\Flipchart\DocumentDownloadUrlService;
+use Bitrix\Disk\Document\Flipchart\DualMode\PilotLog;
+use Bitrix\Disk\Document\Flipchart\DualMode\ServiceProfileResolver;
 use Bitrix\Disk\BaseObject;
 use Bitrix\Disk\AttachedObject;
 use Bitrix\Disk\Configuration;
-use Bitrix\Disk\Controller\Integration\Flipchart;
 use Bitrix\Disk\Document\BoardsHandler;
 use Bitrix\Disk\Document\DocumentEditorUser;
 use Bitrix\Disk\Document\DocumentHandler;
@@ -430,9 +432,11 @@ class CDiskExternalLinkComponent extends DiskComponent
 				$this->arResult['LINK_TO_DOWNLOAD'] = $this->getDownloadUrl();
 			}
 
-			if ($isBoard)
+			if ($isBoard && !$this->setParamsForBoard($documentSession, $this->externalLink->getFile()))
 			{
-				$this->setParamsForBoard($documentSession, $this->externalLink->getFile());
+				$this->showNotFoundPage();
+
+				return false;
 			}
 
 			$this->showFileViewer($isBoard ? self::BOARD_FILE_VIEWER : $documentViewer);
@@ -513,7 +517,12 @@ class CDiskExternalLinkComponent extends DiskComponent
 					return;
 				}
 
-				$this->setParamsForBoard($documentSession, $this->externalLink->getFile());
+				if (!$this->setParamsForBoard($documentSession, $this->externalLink->getFile()))
+				{
+					$this->includeComponentTemplate('error');
+
+					return;
+				}
 
 				$this->showFileViewer(self::BOARD_FILE_VIEWER);
 
@@ -1250,7 +1259,10 @@ class CDiskExternalLinkComponent extends DiskComponent
 			$this->sendJsonErrorResponse();
 		}
 
-		$this->setParamsForBoard($documentSession, $file);
+		if (!$this->setParamsForBoard($documentSession, $file))
+		{
+			$this->sendJsonErrorResponse();
+		}
 
 		$this->showFileViewer(self::BOARD_FILE_VIEWER);
 	}
@@ -1701,8 +1713,27 @@ class CDiskExternalLinkComponent extends DiskComponent
 			: DocumentService::OnlyOffice;
 	}
 
-	private function setParamsForBoard(DocumentSession $documentSession, File $file): void
+	/**
+	 * Answers false when no board service instance may be contacted with this object: the caller must
+	 * then refuse the page the way it refuses any other failure. The editor component decides the same
+	 * way and throws, but executeComponent() swallows that on an ordinary request, so a guest of the
+	 * link would be left with a blank page instead of an answer.
+	 */
+	private function setParamsForBoard(DocumentSession $documentSession, File $file): bool
 	{
+		if (ServiceProfileResolver::createFromOptions()->resolveForEditor($documentSession->getObject()) === null)
+		{
+			PilotLog::error(
+				'Board service profile is not resolved: {entryPoint}, object {objectId}',
+				[
+					'entryPoint' => 'externalLink',
+					'objectId' => (int)$documentSession->getObjectId(),
+				],
+			);
+
+			return false;
+		}
+
 		$this->arResult['DOCUMENT_SESSION'] = $documentSession;
 		$this->arResult['LINK_TO_DOWNLOAD'] = $this->getBoardDocumentUri($documentSession);
 		$this->arResult['STORAGE_ID'] = $file->getStorageId();
@@ -1711,6 +1742,8 @@ class CDiskExternalLinkComponent extends DiskComponent
 		$this->arResult['USER_AVATAR'] = (string)(new Uri($documentSession->getUser()->getAvatarSrc()))->toAbsolute();
 		$this->arResult['DOWNLOAD_TOKEN'] = $this->downloadToken;
 		$this->arResult['ORIGINAL_FILE'] = $file;
+
+		return true;
 	}
 
 	private function getUserIdForBoard(DocumentSession $documentSession): string
@@ -1728,14 +1761,9 @@ class CDiskExternalLinkComponent extends DiskComponent
 
 	private function getBoardDocumentUri(DocumentSession $documentSession): Uri
 	{
-		return (new Flipchart())->getActionUri(
-			'getDocument',
-			[
-				'sessionId' => $documentSession->getExternalHash(),
-				'userId' => $documentSession->getUserId(),
-			],
-			true,
-		);
+		// Public links have always been served over the portal scheme; downgrading them would expose
+		// the session and the grant on the wire.
+		return (new DocumentDownloadUrlService())->build($documentSession, applyLegacyHttpDowngrade: false);
 	}
 
 	private function getOrCreateAnonymousUserIdForBoard(): string

@@ -6,6 +6,9 @@ namespace Bitrix\Bizproc\Public\Service\Template;
 
 use Bitrix\Bizproc\Public\Entity\Template\NodesInstaller;
 use Bitrix\Main\Application;
+use Bitrix\Main\Event;
+use Bitrix\Main\EventManager;
+use Bitrix\Main\EventResult;
 use Bitrix\Main\InvalidOperationException;
 use Bitrix\Main\Web\Json;
 use Bitrix\Bizproc\Api\Enum\Template\WorkflowTemplateType;
@@ -92,22 +95,54 @@ class NodesInstallerService
 			throw new ArgumentException('Invalid section name', 'sectionId');
 		}
 
-		$sectionDir = new IO\Directory($this->getNodesDir() . '/' . $sectionId);
+		$sectionDirs = $this->collectSectionDirs($sectionId);
 
-		if (!$sectionDir->isExists())
+		foreach ($sectionDirs as $sectionDir)
 		{
-			return; //no templates to install
+			$this->installFromSectionDir($sectionDir, $langId);
+		}
+	}
+
+	/**
+	 * @return IO\Directory[]
+	 */
+	private function collectSectionDirs(string $sectionId): array
+	{
+		$dirs = [];
+
+		$ownDir = new IO\Directory($this->getNodesDir() . '/' . $sectionId);
+		if ($ownDir->isExists())
+		{
+			$dirs[] = $ownDir;
 		}
 
-		foreach ($sectionDir->getChildren() as $child)
+		$event = new Event('bizproc', 'onGetExternalNodesDirs', ['sectionId' => $sectionId]);
+		EventManager::getInstance()->send($event);
+
+		foreach ($event->getResults() as $eventResult)
 		{
-			if (!$child->isDirectory())
+			if ($eventResult->getType() !== EventResult::SUCCESS)
 			{
 				continue;
 			}
-			/** @var IO\DirectoryEntry $child */
-			$this->installFromDir($child, $langId);
+
+			$externalDirs = $eventResult->getParameters()['dirs'] ?? [];
+			if (!is_array($externalDirs))
+			{
+				continue;
+			}
+
+			foreach ($externalDirs as $dirPath)
+			{
+				$externalDir = new IO\Directory($dirPath);
+				if ($externalDir->isExists())
+				{
+					$dirs[] = $externalDir;
+				}
+			}
 		}
+
+		return $dirs;
 	}
 
 	private function getTemplateData(int $id): array
@@ -342,6 +377,18 @@ PHP;
 		}
 
 		return $connection->lock($name);
+	}
+
+	private function installFromSectionDir(IO\Directory $sectionDir, string $langId): void
+	{
+		foreach ($sectionDir->getChildren() as $child)
+		{
+			if ($child->isDirectory())
+			{
+				/** @var IO\DirectoryEntry $child */
+				$this->installFromDir($child, $langId);
+			}
+		}
 	}
 
 	private function installFromDir(IO\DirectoryEntry $dir, string $langId): void

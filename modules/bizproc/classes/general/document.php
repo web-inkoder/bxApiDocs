@@ -510,7 +510,7 @@ class CBPDocument
 			$parameters[static::PARAM_DOCUMENT_EVENT_TYPE] = CBPDocumentEventType::None;
 		}
 
-		if (!isset($parameters[static::PARAM_PRE_GENERATED_WORKFLOW_ID]))
+		if (!CBPRuntime::isValidWorkflowId($parameters[static::PARAM_PRE_GENERATED_WORKFLOW_ID] ?? null))
 		{
 			$parameters[static::PARAM_PRE_GENERATED_WORKFLOW_ID] = CBPRuntime::generateWorkflowId();
 		}

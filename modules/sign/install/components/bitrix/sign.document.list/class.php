@@ -25,17 +25,23 @@ use Bitrix\Main\UserTable;
 use Bitrix\Main\UI\Filter;
 use Bitrix\Sign\Access\AccessController;
 use Bitrix\Sign\Access\ActionDictionary;
+use Bitrix\Sign\Access\DocumentAnnulPermission;
+use Bitrix\Sign\Access\Permission\SignPermissionDictionary;
+use Bitrix\Sign\Access\Service\RolePermissionService;
 use Bitrix\Sign\Callback\Handler;
 use Bitrix\Sign\Config\Storage;
 use Bitrix\Sign\Connector\Crm\MyCompany;
 use Bitrix\Sign\Document\Entity\SmartB2e;
 use Bitrix\Sign\Exception\ObjectNotFoundException;
+use Bitrix\Sign\FeatureResolver;
 use Bitrix\Sign\Integration\CRM\Entity;
 use Bitrix\Sign\Internal\Document\Folder\DocumentFolderRelationTable;
 use Bitrix\Sign\Item;
+use Bitrix\Sign\Item\B2e\AnnulmentTarget;
 use Bitrix\Sign\Item\MemberCollection;
 use Bitrix\Sign\Repository\DocumentRepository;
 use Bitrix\Sign\Repository\MemberRepository;
+use Bitrix\Sign\Service\B2e\AnnulmentTargetService;
 use Bitrix\Sign\Service\Container;
 use Bitrix\Sign\Type;
 use Bitrix\Sign\Type\Document\Folder\EntityType as FolderEntityType;
@@ -100,6 +106,16 @@ class SignUserDocumentListComponent extends SignBaseComponent implements Control
 		'/bitrix/services/main/ajax.php?action=sign.document.getFileForSrc&documentHash=#MEMBER_HASH#'
 	;
 	private const PREFIX_FOR_SHORT_FILTER_MEMBER_STATUS = 'member_status__';
+
+	// Three-valued document annulment filter (signed / all / annulled). "Signed" is
+	// the applied default and is therefore the empty value of the field: main.ui.filter
+	// shows the first item of a list field while nothing is chosen, so an empty-valued
+	// first item is what makes the default visible instead of an unset-looking field.
+	private const FILTER_ANNUL_STATUS_KEY = 'ANNUL_STATUS';
+	private const FILTER_ANNUL_STATUS_SIGNED = '';
+	private const FILTER_ANNUL_STATUS_ALL = 'all';
+	private const FILTER_ANNUL_STATUS_ANNULLED = 'annulled';
+
 	private const BANNER_OPTION_CLOSE_PERSONAL = 'show_b2e_personal_grid_banner';
 	private const BANNER_OPTION_CLOSE_SAFE = 'show_b2e_safe_grid_banner';
 	private const BANNER_OPTION_CLOSE_CURRENT = 'show_b2e_current_grid_banner';
@@ -154,6 +170,7 @@ class SignUserDocumentListComponent extends SignBaseComponent implements Control
 	private \Bitrix\Sign\Service\Sign\MemberService $memberService;
 	private \Bitrix\Sign\Service\Sign\Document\Safe\ListService $safeListService;
 	private \Bitrix\Sign\Service\Sign\Document\Safe\AccessService $safeAccessService;
+	private AnnulmentTargetService $annulmentTargetService;
 
 	// Batched safe company cache: CRM SmartB2e entity id => {id,title}|null (see resolveCompaniesByDocuments()).
 	private array $safeCompanyByEntityId = [];
@@ -176,6 +193,7 @@ class SignUserDocumentListComponent extends SignBaseComponent implements Control
 		$this->memberService = Container::instance()->getMemberService();
 		$this->safeListService = Container::instance()->getSafeListService();
 		$this->safeAccessService = Container::instance()->getSafeAccessService();
+		$this->annulmentTargetService = new AnnulmentTargetService();
 	}
 
 	public function executeComponent(): void
@@ -397,6 +415,13 @@ class SignUserDocumentListComponent extends SignBaseComponent implements Control
 		$this->arResult['IS_EXCEL_EXPORT_AVAILABLE'] = $this->isExportableType();
 		$this->arResult['IS_EXCEL_EXPORT_MODE'] = $this->isExcelExportMode();
 		$this->arResult['VISIBLE_COLUMNS_FOR_EXCEL'] = $this->getVisibleColumnsForExcel();
+		// Annulment actions live in the company safe and per-document process grids
+		// (both gated by the feature flag); the endpoints still re-check rights and
+		// the member role/status per record. The single-row action drives the row
+		// menu, the mass action drives the checkboxes and the group panel.
+		$isAnnulEnabled = $this->isAnnulActionEnabled();
+		$this->arResult['IS_ANNUL_SINGLE_ACTION_ENABLED'] = $isAnnulEnabled;
+		$this->arResult['IS_ANNUL_MASS_ACTIONS_ENABLED'] = $isAnnulEnabled;
 	}
 
 	private function isExcelExportMode(): bool
@@ -563,6 +588,18 @@ class SignUserDocumentListComponent extends SignBaseComponent implements Control
 			'member' => [
 				'default' => true,
 			],
+		];
+
+		// The annulment mark reuses the shared status column; it is added only
+		// when the feature is enabled, otherwise the safe grid stays as before.
+		if ($this->isAnnulMarkFeatureEnabled())
+		{
+			$columns['memberStatus'] = [
+				'default' => true,
+			];
+		}
+
+		$columns += [
 			'download' => [
 				'default' => true,
 				'gridSort' => 800,
@@ -592,6 +629,22 @@ class SignUserDocumentListComponent extends SignBaseComponent implements Control
 		[$activeField] = $this->getSafeDataOrder();
 
 		return self::highlightActiveSafeSortColumns($columns, $activeField);
+	}
+
+	private function isAnnulMarkFeatureEnabled(): bool
+	{
+		return FeatureResolver::instance()->released('kedoDocumentAnnul');
+	}
+
+	/**
+	 * The annulment mark lives on the signer member record and is surfaced in the
+	 * company safe and the per-document process grids only, behind the feature
+	 * flag. Personal/current grids never expose it.
+	 */
+	private function isAnnulActionEnabled(): bool
+	{
+		return in_array($this->type, [self::SAFE_TYPE, self::DOCUMENT_TYPE], true)
+			&& $this->isAnnulMarkFeatureEnabled();
 	}
 
 	/**
@@ -1006,7 +1059,52 @@ class SignUserDocumentListComponent extends SignBaseComponent implements Control
 
 		$filter->where('ENTITY_TYPE', '!=', EntityType::ROLE);
 
+		// The annulment status filter is a company-safe-only control: only the
+		// safe grid exposes the "All / Signed / Annulled" switch. Applying the
+		// default "hide annulled" predicate to the shared query builder would
+		// silently drop annulled documents from the personal/document grids too,
+		// with no UI there to bring them back. Gated by the feature flag as well
+		// so the query path stays byte-for-byte identical while the feature is off.
+		if ($this->type === self::SAFE_TYPE && $this->isAnnulMarkFeatureEnabled())
+		{
+			$this->applyAnnulmentFilter($filter, $requestFilter);
+		}
+
 		return $filter;
+	}
+
+	/**
+	 * Applies the three-valued annulment status filter to the query.
+	 *
+	 * Default (empty filter / "signed" mode) excludes annulled records; the
+	 * "annulled" value shows only annulled records; "all" applies no predicate.
+	 * The mark now lives on the member record, so the predicate targets the
+	 * member's own ANNULLED column (the safe query is built over MemberTable).
+	 */
+	private function applyAnnulmentFilter(ConditionTree $filter, array $requestFilter): void
+	{
+		$annulStatus = $this->getAnnulStatusFilterValue($requestFilter);
+		if ($annulStatus === self::FILTER_ANNUL_STATUS_ALL)
+		{
+			return;
+		}
+
+		$filter->where('ANNULLED', $annulStatus === self::FILTER_ANNUL_STATUS_ANNULLED);
+	}
+
+	/**
+	 * Value of the annulment status filter field. An absent field means the default
+	 * "signed only" mode, which is the empty value of the field itself.
+	 */
+	private function getAnnulStatusFilterValue(array $requestFilter): string
+	{
+		$annulStatus = $requestFilter[self::FILTER_ANNUL_STATUS_KEY] ?? null;
+		if (is_array($annulStatus))
+		{
+			$annulStatus = $annulStatus[0] ?? null;
+		}
+
+		return (string)($annulStatus ?? self::FILTER_ANNUL_STATUS_SIGNED);
 	}
 
 	/**
@@ -1520,6 +1618,19 @@ class SignUserDocumentListComponent extends SignBaseComponent implements Control
 			return true;
 		}
 
+		// The annulment status narrows the level too: asked for the annulled records
+		// only, the root must not list a folder that holds none of them. The default
+		// "signed" mode is the composition of the level the user sees without touching
+		// the filter, so it leaves the folder rows alone - gating there would also drop
+		// every folder with no matching member, a folder still filling up included.
+		if (
+			$this->isAnnulMarkFeatureEnabled()
+			&& $this->getAnnulStatusFilterValue($requestFilter) === self::FILTER_ANNUL_STATUS_ANNULLED
+		)
+		{
+			return true;
+		}
+
 		foreach (['ROLE', 'ENTITY_ID', 'REPRESENTATIVE', 'CREATED_BY_ID', 'COMPANY', 'MEMBER_STATUS', 'SIGNED'] as $key)
 		{
 			if (isset($requestFilter[$key]) && is_array($requestFilter[$key]) && $requestFilter[$key] !== [])
@@ -1843,22 +1954,99 @@ class SignUserDocumentListComponent extends SignBaseComponent implements Control
 			: [];
 
 		$currentCulture = Context::getCurrent()->getCulture();
+		// The annulment mark lives on the signer member record and is surfaced in
+		// the company safe and process grids behind the feature flag; resolve the
+		// owner scope once (reusing the access controller's already-memoized
+		// UserModel) and skip it entirely for other grids or when the feature is
+		// off, keeping the pre-feature behaviour.
+		$isAnnulMarkEnabled = $this->isAnnulActionEnabled();
+		$annulPermission = $isAnnulMarkEnabled
+			? DocumentAnnulPermission::fromUserModel($this->accessController->getUser())
+			: null
+		;
+		// Which signing every row speaks about (ALG-01). The safe is the only mode that
+		// keeps the signer row of an employee-initiated document out of its result set,
+		// so it is the only one where a row may point at a member other than the one it
+		// displays; the process grid lists those signer rows and they answer for
+		// themselves. One query for the whole page, none when the feature is off.
+		$annulmentTargets = $this->annulmentTargetService->resolveForPage(
+			$memberCollection,
+			$documentCollection,
+			$isAnnulMarkEnabled,
+			$this->type === self::SAFE_TYPE,
+		);
+		$isSafeSignedLabelEnabled = $this->type === self::SAFE_TYPE && $this->isAnnulMarkFeatureEnabled();
 		/** @var Item\Member $member */
 		foreach ($memberCollection as $member)
 		{
 			$memberData = [];
 			$document = $documents[$member->documentId];
+			$annulmentTarget = $annulmentTargets[$member->id] ?? null;
 
 			// DTO-01: document rows are tagged so the grid can tell them apart from folder rows.
 			$memberData['rowType'] = 'document';
 			$memberData['ID'] = $member->id;
 			$memberData['relationId'] = $relationIdMap[$member->id] ?? null;
+			$memberData['DOCUMENT_UID'] = (string)$document->uid;
+			// The single/mass annul actions address a member record, so a member uid is
+			// the only authoritative identifier for the annul endpoints; never fall
+			// back to the document uid here. Which member that is - the displayed one
+			// or the signing the row speaks about - is decided below.
+			$memberData['MEMBER_UID'] = (string)$member->uid;
+			if ($isAnnulMarkEnabled)
+			{
+				$memberData = array_merge($memberData, self::buildAnnulmentRowData(
+					$member,
+					$annulmentTarget,
+					$annulPermission->canAnnulDocumentOwnedBy($document->createdById),
+				));
+			}
+
+			$resultFileInfo = null;
+			$title = null;
+
+			if (
+				isset($this->arResult['COLUMNS']['title'])
+				|| isset($this->arResult['COLUMNS']['download'])
+				|| (
+					isset($this->arResult['COLUMNS']['action'])
+					&& (
+						$member->status === MemberStatus::DONE
+						|| (
+							$document->status === Type\DocumentStatus::STOPPED
+							&& $member->status === Type\MemberStatus::READY
+							&& $member->role === Role::ASSIGNEE
+						)
+					)
+				)
+			)
+			{
+				$title = $this->getDocumentTitle($document);
+			}
+
+			if (
+				isset($this->arResult['COLUMNS']['download'])
+				|| ($this->type === self::SAFE_TYPE && isset($this->arResult['COLUMNS']['title']))
+				|| (
+					isset($this->arResult['COLUMNS']['action'])
+					&& (
+						$member->status === MemberStatus::DONE
+						|| (
+							$document->status === Type\DocumentStatus::STOPPED
+							&& $member->status === Type\MemberStatus::READY
+							&& $member->role === Role::ASSIGNEE
+						)
+					)
+				)
+			)
+			{
+				$resultFileInfo = $this->getResultFileInfo($member, $title);
+			}
 
 			if (isset($this->arResult['COLUMNS']['title']))
 			{
 				$withLink = !in_array($this->type, [self::PERSONAL_TYPE, self::CURRENT_TYPE], true);
-				$title = $this->getDocumentTitle($document);
-				$memberData['TITLE_INFO'] = $this->getTitleInfo($title, $document->entityId, $withLink);
+				$memberData['TITLE_INFO'] = $this->getTitleInfo($title, $document->entityId, $withLink, $resultFileInfo);
 			}
 
 			if (isset($this->arResult['COLUMNS']['createdBy']))
@@ -1876,7 +2064,6 @@ class SignUserDocumentListComponent extends SignBaseComponent implements Control
 			// so the export path skips it entirely - never resolving the heavy per-row signed file URL.
 			if (!$isSafeExport && isset($this->arResult['COLUMNS']['download']))
 			{
-				$resultFileInfo = $this->getResultFileInfo($member);
 				$memberData['RESULT_FILE_INFO'] = $resultFileInfo;
 			}
 
@@ -1906,7 +2093,6 @@ class SignUserDocumentListComponent extends SignBaseComponent implements Control
 					)
 				)
 				{
-					$resultFileInfo = $this->getResultFileInfo($member);
 					if ($resultFileInfo !== null)
 					{
 						$memberData['ACTION'] = [
@@ -1948,7 +2134,13 @@ class SignUserDocumentListComponent extends SignBaseComponent implements Control
 
 			if (isset($this->arResult['COLUMNS']['memberStatus']))
 			{
-				$memberData['MEMBER_STATUS'] = self::calculateStatus($member, $document);
+				$memberData['MEMBER_STATUS'] = $this->calculateStatus(
+					$member,
+					$document,
+					$annulmentTarget,
+					$isAnnulMarkEnabled,
+					$isSafeSignedLabelEnabled,
+				);
 			}
 
 			if (isset($this->arResult['COLUMNS']['dateSign']) && $this->isMemberSignDateAllowedToShow($member))
@@ -2010,7 +2202,7 @@ class SignUserDocumentListComponent extends SignBaseComponent implements Control
 		return $map;
 	}
 
-	private function getTitleInfo(string $title, int $id, bool $withLink): array
+	private function getTitleInfo(string $title, int $id, bool $withLink, ?array $resultFileInfo): array
 	{
 		$result = [
 			'TEXT' => $title,
@@ -2019,6 +2211,24 @@ class SignUserDocumentListComponent extends SignBaseComponent implements Control
 		if ($withLink)
 		{
 			$result ['DOCUMENT_LINK'] = Entity::getDetailPageUri(SmartB2e::getEntityTypeId(), $id);
+		}
+
+		if ($this->type === self::SAFE_TYPE)
+		{
+			$result['VIEW_URL'] = $resultFileInfo['VIEW_URL'] ?? null;
+
+			if (isset($resultFileInfo['DOWNLOAD_URL_PRINTED']))
+			{
+				$result['DOWNLOAD_URL'] = $resultFileInfo['DOWNLOAD_URL_PRINTED'];
+			}
+			elseif (isset($resultFileInfo['DOWNLOAD_URL']) && isset($resultFileInfo['EXTENSION']) && $resultFileInfo['EXTENSION'] === 'pdf')
+			{
+				$result['DOWNLOAD_URL'] = $resultFileInfo['DOWNLOAD_URL'];
+			}
+			else
+			{
+				$result['DOWNLOAD_URL'] = null;
+			}
 		}
 
 		return $result;
@@ -2196,7 +2406,7 @@ class SignUserDocumentListComponent extends SignBaseComponent implements Control
 		];
 	}
 
-	private function getResultFileInfo(Item\Member $member): ?array
+	private function getResultFileInfo(Item\Member $member, string $title): ?array
 	{
 		$data = $this->getDownloadResultFileUrl(
 			\Bitrix\Sign\Type\EntityType::MEMBER,
@@ -2215,10 +2425,16 @@ class SignUserDocumentListComponent extends SignBaseComponent implements Control
 			return null;
 		}
 
+		$dataView = $this->getFileUrlForUiViewer(
+			$dataPrinted ?? $data
+		);
+
 		return [
 			'EXTENSION' => $data['ext'],
 			'DOWNLOAD_URL' => $data['url'],
 			'DOWNLOAD_URL_PRINTED' => $dataPrinted['url'] ?? null,
+			'VIEW_URL' => $dataView['url'] ?? null,
+			'TITLE' => $title,
 		];
 	}
 
@@ -2226,6 +2442,31 @@ class SignUserDocumentListComponent extends SignBaseComponent implements Control
 	{
 		$operation = new Bitrix\Sign\Operation\GetSignedB2eFileUrl($entityTypeId, $entityId, $fileCode);
 		$result = $operation->launch();
+		if (!$result->isSuccess() || !$operation->ready)
+		{
+			return null;
+		}
+
+		$data = $result->getData();
+
+		if (!isset($data['url']))
+		{
+			return null;
+		}
+
+		return $data;
+	}
+
+	private function getFileUrlForUiViewer(array $data): ?array
+	{
+		if (!isset($data['url']) || !isset($data['ext']))
+		{
+			return null;
+		}
+
+		$operation = new Bitrix\Sign\Operation\GetSignedB2eFileUrlForUiViewer($data);
+		$result = $operation->launch();
+
 		if (!$result->isSuccess() || !$operation->ready)
 		{
 			return null;
@@ -2324,6 +2565,19 @@ class SignUserDocumentListComponent extends SignBaseComponent implements Control
 				'id' => 'ID',
 				'name' => 'ID',
 				'default' => false,
+			],
+			'annulStatus' => [
+				'id' => self::FILTER_ANNUL_STATUS_KEY,
+				'name' => Loc::getMessage('SIGN_DOCUMENT_LIST_TITLE_FILTER_LABEL_STATUS'),
+				'type' => 'list',
+				'default' => true,
+				// The default mode comes first: it carries the empty value, so the field
+				// shows it as the current one and the user sees which records are hidden.
+				'items' => [
+					self::FILTER_ANNUL_STATUS_SIGNED => Loc::getMessage('SIGN_DOCUMENT_LIST_STATUS_SIGNED'),
+					self::FILTER_ANNUL_STATUS_ALL => Loc::getMessage('SIGN_DOCUMENT_LIST_STATUS_ALL'),
+					self::FILTER_ANNUL_STATUS_ANNULLED => Loc::getMessage('SIGN_DOCUMENT_LIST_STATUS_ANNULLED'),
+				],
 			],
 			'dateSign' => [
 				'id' => 'DATE_SIGN',
@@ -2496,7 +2750,16 @@ class SignUserDocumentListComponent extends SignBaseComponent implements Control
 
 	private function getFilterItemsForSafe(): array
 	{
-		$items = [
+		$items = [];
+
+		// The three-valued annulment status filter is added only when the feature
+		// is enabled; otherwise the safe filter keeps its previous set of fields.
+		if ($this->isAnnulMarkFeatureEnabled())
+		{
+			$items['annulStatus'] = ['default' => true];
+		}
+
+		$items += [
 			'dateSign' => ['default' => true],
 			'dateCreate' => [],
 			'employee' => ['default' => true],
@@ -2844,14 +3107,78 @@ class SignUserDocumentListComponent extends SignBaseComponent implements Control
 		);
 	}
 
-	private static function calculateStatus(Item\Member $member, Item\Document $document): array
+	/**
+	 * The three row values the grid template and the annul extension read, taken from the
+	 * signing the row speaks about rather than from the member it displays. They coincide
+	 * everywhere except the company safe row of an employee-initiated document - see
+	 * AnnulmentTargetService.
+	 *
+	 * Kept free of the component state so the whole rule is checkable without a grid mode,
+	 * an access controller or the database: the owner scope arrives already resolved, and
+	 * the eligibility of the target alone never grants the action.
+	 *
+	 * @return array{MEMBER_UID: string, IS_ANNULLED: bool, CAN_ANNUL: bool}
+	 */
+	private static function buildAnnulmentRowData(
+		Item\Member $member,
+		?AnnulmentTarget $target,
+		bool $isOwnedByAnnullableDocument,
+	): array
 	{
+		return [
+			'MEMBER_UID' => $target === null ? (string)$member->uid : $target->uid,
+			'IS_ANNULLED' => $target === null ? $member->annulled : $target->annulled,
+			'CAN_ANNUL' => $target !== null && $target->eligible && $isOwnedByAnnullableDocument,
+		];
+	}
+
+	/**
+	 * @param AnnulmentTarget|null $target the signing the row speaks about; null keeps the
+	 *        pre-feature reading of the displayed member's own mark.
+	 * @param bool $isAnnulMarkEnabled result of isAnnulActionEnabled() for this grid.
+	 * @param bool $isSafeSignedLabelEnabled the safe-only collapse of a completed record to
+	 *        a plain "Signed" label.
+	 */
+	private function calculateStatus(
+		Item\Member $member,
+		Item\Document $document,
+		?AnnulmentTarget $target,
+		bool $isAnnulMarkEnabled,
+		bool $isSafeSignedLabelEnabled,
+	): array
+	{
+		$identifier = 'sign_document_grid_label_id_' . $member->id;
+
+		// The annulment mark reads as "Annulled" in both the company safe and the
+		// per-document process grid. It is taken from the target so that a safe row
+		// showing the company representative reports the employee's annulled signing.
+		if ($isAnnulMarkEnabled && ($target === null ? $member->annulled : $target->annulled))
+		{
+			return [
+				'TEXT' => (string)Loc::getMessage('SIGN_DOCUMENT_LIST_STATUS_ANNULLED'),
+				'COLOR' => Grid\Cell\Label\Color::DEFAULT,
+				'IDENTIFIER' => $identifier,
+			];
+		}
+
+		// The company safe is a finished-documents vault, so a non-annulled record
+		// collapses to a plain "Signed" label. The process grid keeps its detailed
+		// per-member stage labels (per role/status), so the collapse stays safe-only.
+		if ($isSafeSignedLabelEnabled && $member->status === MemberStatus::DONE)
+		{
+			return [
+				'TEXT' => (string)Loc::getMessage('SIGN_DOCUMENT_LIST_STATUS_SIGNED'),
+				'COLOR' => Grid\Cell\Label\Color::SUCCESS,
+				'IDENTIFIER' => $identifier,
+			];
+		}
+
 		$stageInfo = Ui\Member\Stage::createInstance($member, $document)->getInfo();
 
 		return [
 			'TEXT' => $stageInfo['text'],
 			'COLOR' => $stageInfo['color'],
-			'IDENTIFIER' => 'sign_document_grid_label_id_' . $member->id,
+			'IDENTIFIER' => $identifier,
 		];
 	}
 

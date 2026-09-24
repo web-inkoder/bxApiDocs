@@ -169,7 +169,13 @@ final class StorageActivityService
 		$provider = new StorageTypeProvider();
 		$type = $provider->getType(['CODE' => $storageCode], ['ID']);
 
-		return self::$storageIdByCodeCache[$storageCode] = (int)$type?->getId();
+		$id = (int)$type?->getId();
+		if ($id > 0)
+		{
+			self::$storageIdByCodeCache[$storageCode] = $id;
+		}
+
+		return $id;
 	}
 
 	/**

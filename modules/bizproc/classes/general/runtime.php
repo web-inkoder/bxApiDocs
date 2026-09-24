@@ -225,7 +225,12 @@ class CBPRuntime
 			$this->StartRuntime();
 		}
 
-		$workflowId = $workflowParameters[CBPDocument::PARAM_PRE_GENERATED_WORKFLOW_ID] ?? static::generateWorkflowId();
+		$workflowId = $workflowParameters[CBPDocument::PARAM_PRE_GENERATED_WORKFLOW_ID] ?? null;
+		if (!static::isValidWorkflowId($workflowId))
+		{
+			$workflowId = static::generateWorkflowId();
+			unset($workflowParameters[CBPDocument::PARAM_PRE_GENERATED_WORKFLOW_ID]);
+		}
 
 		if ($parentWorkflow)
 		{
@@ -279,7 +284,13 @@ class CBPRuntime
 	{
 		$complexDocumentId = CBPHelper::ParseDocumentId($documentId);
 
-		$workflowId = $workflowParameters[CBPDocument::PARAM_PRE_GENERATED_WORKFLOW_ID] ?? static::generateWorkflowId();
+		$workflowId = $workflowParameters[CBPDocument::PARAM_PRE_GENERATED_WORKFLOW_ID] ?? null;
+		if (!static::isValidWorkflowId($workflowId))
+		{
+			$workflowId = static::generateWorkflowId();
+			unset($workflowParameters[CBPDocument::PARAM_PRE_GENERATED_WORKFLOW_ID]);
+		}
+
 		$workflow = new DebugWorkflow($workflowId, $this);
 
 		$loader = CBPWorkflowTemplateLoader::GetLoader();
@@ -413,6 +424,16 @@ class CBPRuntime
 	public static function generateWorkflowId(): string
 	{
 		return uniqid('', true);
+	}
+
+	/**
+	 * The only source of truth about the workflow id format: it must match what generateWorkflowId()
+	 * produces. Change the two together, and do not repeat the pattern anywhere else.
+	 * The D modifier is required: without it $ would also match before a trailing newline.
+	 */
+	public static function isValidWorkflowId(mixed $workflowId): bool
+	{
+		return is_string($workflowId) && preg_match('/^[0-9a-f]{13}\d\.\d{8}$/D', $workflowId) === 1;
 	}
 
 	/*******************  SERVICES  *********************************************************/

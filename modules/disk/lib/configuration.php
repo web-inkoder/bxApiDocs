@@ -65,6 +65,11 @@ final class Configuration
 			&& MarkdownRenderService::isAvailable();
 	}
 
+	public static function isUniversalFilePickerEnabled(): bool
+	{
+		return Option::get(Driver::INTERNAL_MODULE_ID, 'disk_enable_universal_file_picker', 'N') === 'Y';
+	}
+
 	/**
 	 * Returns maximum size (in bytes) of a markdown file that the viewer renders.
 	 * Single source of truth for the markdown render size limit.

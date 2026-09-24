@@ -716,13 +716,11 @@ class CalendarAjax extends \Bitrix\Main\Engine\Controller
 			return [];
 		}
 
-		// for personal context only
 		$type = Dictionary::CALENDAR_TYPE['user'];
-		$ownerId = \CCalendar::GetCurUserId();
 		$userId = \CCalendar::GetCurUserId();
 
 		$isCollabUser = Util::isCollabUser($userId);
-		$sections = \CCalendarSect::prepareSectionListResponse($type, (string)$ownerId);
+		$sections = $this->getSectionsForStandaloneForm($userId, $isCollabUser);
 
 		$responseParams = [];
 		$responseParams['sections'] = $sections;
@@ -748,9 +746,97 @@ class CalendarAjax extends \Bitrix\Main\Engine\Controller
 		$responseParams['eventWithEmailGuestEnabled'] = Bitrix24Manager::isFeatureEnabled(FeatureDictionary::CALENDAR_EVENTS_WITH_EMAIL_GUESTS);
 		$responseParams['isCollabFeatureEnabled'] = \Bitrix\Calendar\Integration\SocialNetwork\Collab\CollabFeature::isAvailable();
 		$responseParams['projectFeatureEnabled'] = SocialNetwork\FeatureService::isProjectFeatureEnabled();
+		$responseParams['isNewProjectsOn'] = SocialNetwork\FeatureService::isNewProjectsOn();
 		$responseParams['teamsAsAttendeeEnabled'] = HumanResources\FeatureService::isTeamsAsAttendeeEnabled();
 
 		return $responseParams;
+	}
+
+	/**
+	 * The compact form is opened outside the calendar screen, so this action is the only place
+	 * that can guarantee a container the event will be saved into.
+	 *
+	 * The lists of the two branches mean different things. The personal one is everything the user
+	 * sees: the portal section of open events, followed calendars of colleagues and virtual Google
+	 * sections come with it, and not all of them take an event. The collab one carries sections with
+	 * the write right only. Picking a section by that right is left to the client.
+	 */
+	private function getSectionsForStandaloneForm(int $userId, bool $isCollabUser): array
+	{
+		return $isCollabUser
+			? $this->getCollabSectionsForStandaloneForm($userId)
+			: $this->getPersonalSectionsForStandaloneForm($userId)
+		;
+	}
+
+	private function getPersonalSectionsForStandaloneForm(int $userId): array
+	{
+		$type = Dictionary::CALENDAR_TYPE['user'];
+
+		// user calendars are denied to an external user by the same policy that builds the list
+		// below, so a container created for them would never be offered
+		if (Loader::includeModule('extranet') && !\CExtranet::IsIntranetUser(SITE_ID, $userId))
+		{
+			return [];
+		}
+
+		// the section list is wider than the personal container (open events add the portal
+		// section to it), so the container is probed by the method that also creates it
+		$container = \CCalendarSect::GetSectionForOwner($type, $userId, true);
+		if (empty($container['sectionId']))
+		{
+			// the guarantee is the whole point of this action, so its refusal must not reach the client
+			// as the empty list an external user or a collaber without a single collab legally gets
+			$this->addError(new Error('[sc01] Personal calendar section is unavailable', 'section_guarantee_failed'));
+
+			return [];
+		}
+
+		if ($container['autoCreated'])
+		{
+			\CCalendarSect::SetClearOperationCache(true);
+		}
+
+		return \CCalendarSect::prepareSectionListResponse($type, (string)$userId);
+	}
+
+	// a personal section is rejected on save for a collab user, so only collab sections are offered
+	private function getCollabSectionsForStandaloneForm(int $userId): array
+	{
+		$collabIds = UserCollabs::getInstance()->getIds($userId);
+		if (empty($collabIds))
+		{
+			return [];
+		}
+
+		// section access rules ask for the group role of an external user one section at a time;
+		// the batch form fills the same static role cache in a single query
+		\CSocNetUserToGroup::GetUserRole($userId, $collabIds);
+
+		$sectionList = \CCalendar::getSectionList([
+			'CAL_TYPE' => Dictionary::CALENDAR_TYPE['group'],
+			'OWNER_ID' => $collabIds,
+			'ACTIVE' => 'Y',
+			'checkPermissions' => true,
+			'getPermissions' => true,
+		]);
+
+		$sections = [];
+		foreach ($sectionList as $section)
+		{
+			if (
+				($section['PERM']['edit'] ?? false)
+				&& !\CCalendarSect::CheckGoogleVirtualSection(
+					$section['GAPI_CALENDAR_ID'] ?? null,
+					$section['EXTERNAL_TYPE'] ?? null,
+				)
+			)
+			{
+				$sections[] = $section;
+			}
+		}
+
+		return $sections;
 	}
 
 	private function getEventEditFormHiddenFields(array $entry): array
