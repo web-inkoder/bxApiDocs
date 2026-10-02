@@ -143,10 +143,16 @@ class CBPCrmChangeStatusActivity extends CBPActivity
 			/** @var CBPDocumentService $ds */
 			$ds = $runtime->GetService('DocumentService');
 
+			// Attribute the change to the workflow starter when no
+			// explicit ModifiedBy. method_exists guards bizproc being older than crm.
+			$modifiedBy = method_exists($this, 'getModifiedByOrStarter')
+				? $this->getModifiedByOrStarter()
+				: $this->ModifiedBy
+			;
 			$ds->UpdateDocument(
 				$documentId,
 				[$fieldKey => $targetStatus],
-				$this->ModifiedBy
+				$modifiedBy
 			);
 
 			\CCrmBizProcHelper::sendOperationsAnalytics(

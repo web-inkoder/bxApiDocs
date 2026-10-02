@@ -30,6 +30,77 @@ class CBPCrmChangeDealCategoryActivity extends CBPActivity
 		];
 	}
 
+	/**
+	 * USER_ID is always passed: without it MoveToCategory takes the ambient context user with no
+	 * scope check and, when there is none, writes no MODIFY_BY_ID at all - after which the author
+	 * of the timeline comes from the entity fields and ends up being the deal responsible.
+	 */
+	protected function buildMoveOptions(): array
+	{
+		return [
+			'ENABLE_WORKFLOW_CHECK' => false,
+			'PREFERRED_STAGE_ID' => CBPHelper::stringify($this->StageId),
+			'USER_ID' => $this->resolveAuthorId(),
+		];
+	}
+
+	protected function resolveAuthorId(): int
+	{
+		$starterId = $this->resolveStarterId();
+
+		return $starterId > 0 ? $starterId : $this->resolveAuthorFromContext();
+	}
+
+	/**
+	 * The acting person, or 0 when there is none. Unlike resolveAuthorId() it never falls back to
+	 * the system user: whoever passes this on as the automation initiator has to be able to say
+	 * "nobody", or the next link of the chain loses its own chance to resolve a live user.
+	 */
+	protected function resolveInitiatorId(): int
+	{
+		$starterId = $this->resolveStarterId();
+
+		return $starterId > 0 ? $starterId : $this->resolveInitiatorFromContext();
+	}
+
+	protected function resolveStarterId(): int
+	{
+		// Attribute the move to the workflow starter when no explicit ModifiedBy. method_exists
+		// guards bizproc shipping the method (26.1500.0) later than the trait above (26.1100.0).
+		$modifiedBy = method_exists($this, 'getModifiedByOrStarter')
+			? $this->getModifiedByOrStarter()
+			: $this->ModifiedBy
+		;
+
+		// Stringified first: stripUserPrefix() keeps a list a list, and casting one to int gives 1.
+		return (int)CBPHelper::stripUserPrefix(CBPHelper::stringify($modifiedBy));
+	}
+
+	protected function resolveAuthorFromContext(): int
+	{
+		$initiatorId = $this->resolveInitiatorFromContext();
+
+		return $initiatorId > 0 ? $initiatorId : Crm\Service\SystemUser::getDefaultAuthorId();
+	}
+
+	protected function resolveInitiatorFromContext(): int
+	{
+		$context = Crm\Service\Container::getInstance()->getContext();
+
+		$explicitUserId = (int)($context->getExplicitUserId() ?? 0);
+		if ($explicitUserId > 0)
+		{
+			return $explicitUserId;
+		}
+
+		if (!$context->isNonInteractiveScope())
+		{
+			return $context->getUserId();
+		}
+
+		return 0;
+	}
+
 	public function Execute()
 	{
 		if (!CModule::IncludeModule('crm'))
@@ -77,14 +148,12 @@ class CBPCrmChangeDealCategoryActivity extends CBPActivity
 			return CBPActivityExecutionStatus::Closed;
 		}
 
+		$moveOptions = $this->buildMoveOptions();
+
 		$resultError = \CCrmDeal::MoveToCategory(
 			$sourceDealId,
 			(int)$this->CategoryId,
-			[
-				'ENABLE_WORKFLOW_CHECK' => false,
-				'USER_ID' => $sourceFields['ASSIGNED_BY_ID'],
-				'PREFERRED_STAGE_ID' => CBPHelper::stringify($this->StageId),
-			]
+			$moveOptions
 		);
 
 			if ($resultError === Crm\Category\DealCategoryChangeError::NONE)
@@ -117,6 +186,13 @@ class CBPCrmChangeDealCategoryActivity extends CBPActivity
 				//Region automation
 				$starter = new \Bitrix\Crm\Automation\Starter(\CCrmOwnerType::Deal, $sourceDealId);
 				$starter->setContextToBizproc();
+				// Carry the acting person into the target funnel: without an initiator the next
+				// robot of the chain writes history under the responsible user again.
+				$initiatorId = $this->resolveInitiatorId();
+				if ($initiatorId > 0)
+				{
+					$starter->setUserId($initiatorId);
+				}
 				$starter->runOnUpdate($newFields, $sourceFields);
 				//End region
 			}

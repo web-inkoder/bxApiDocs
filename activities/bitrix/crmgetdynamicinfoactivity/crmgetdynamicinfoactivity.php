@@ -400,9 +400,19 @@ class CBPCrmGetDynamicInfoActivity extends \Bitrix\Bizproc\Activity\BaseActivity
 		bool $includeRelatedEntityTypes = false,
 	): array
 	{
-		$propertiesMap = static::getPropertiesDialogMap();
-		$allEntityTypeOptions = (array)($propertiesMap['DynamicTypeId']['Options'] ?? []);
-		$allFilterFieldsMap = (array)($propertiesMap['DynamicFilterFields']['Map'] ?? []);
+		$allEntityTypeOptions = [];
+		foreach (Container::getInstance()->getTypesMap()->getFactories() as $factory)
+		{
+			$entityTypeId = $factory->getEntityTypeId();
+			$documentType = CCrmBizProcHelper::ResolveDocumentType($entityTypeId);
+
+			if (isset($documentType))
+			{
+				$allEntityTypeOptions[$entityTypeId] =
+					static::getDocumentService()->getDocumentTypeName($documentType)
+				;
+			}
+		}
 
 		if ($onlyDynamicEntities)
 		{
@@ -431,11 +441,12 @@ class CBPCrmGetDynamicInfoActivity extends \Bitrix\Bizproc\Activity\BaseActivity
 			);
 		}
 
-		$filterFieldsMap = array_intersect_key($allFilterFieldsMap, $entityTypeOptions);
-
+		$filterFieldsMap = [];
 		$documentTypeMap = [];
 		foreach (array_keys($entityTypeOptions) as $entityTypeId)
 		{
+			$filterFieldsMap[$entityTypeId] = static::getFilteringFieldsMap((int)$entityTypeId);
+
 			$entityDocumentType = CCrmBizProcHelper::ResolveDocumentType((int)$entityTypeId);
 			if (is_array($entityDocumentType))
 			{

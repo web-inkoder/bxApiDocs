@@ -32,6 +32,11 @@ use Bitrix\Disk\Internals\DiskComponent;
 use Bitrix\Disk\Internals\Error\Error;
 use Bitrix\Disk\Internals\ObjectTable;
 use Bitrix\Disk\Internal\Service\ExternalLink\ExternalLinkPasswordService;
+use Bitrix\Disk\Internal\Service\TiffPreview\ErrorCode;
+use Bitrix\Disk\Internal\Service\TiffPreview\PreviewStatus;
+use Bitrix\Disk\Internal\Service\TiffPreviewService;
+use Bitrix\Disk\Internal\Service\ExternalLink\PasswordProtectionResult;
+use Bitrix\Disk\Internal\Service\ExternalLink\PasswordProtectionState;
 use Bitrix\Disk\Public\Provider\ExternalLinkProvider;
 use Bitrix\Disk\TypeFile;
 use Bitrix\Disk\Ui\FileAttributes;
@@ -49,6 +54,7 @@ use Bitrix\Main\Engine\Response\Redirect;
 use Bitrix\Main\HttpResponse;
 use Bitrix\Main\Localization\Loc;
 use Bitrix\Main\Security\Random;
+use Bitrix\Main\Security\Sign\Signer;
 use Bitrix\Main\SystemException;
 use Bitrix\Main\Web\Uri;
 use JetBrains\PhpStorm\NoReturn;
@@ -286,6 +292,7 @@ class CDiskExternalLinkComponent extends DiskComponent
 			'showViewHtml',
 			'showHtml',
 			'showFile',
+			'showTiffPreview',
 			'showPreview',
 			'showView',
 		];
@@ -471,7 +478,12 @@ class CDiskExternalLinkComponent extends DiskComponent
 		if ($isFile)
 		{
 			$passwordPassed = !$this->arResult['PROTECTED_BY_PASSWORD'] || $this->arResult['VALID_PASSWORD'];
-			$isDocument = $this->isViewableDocument($this->externalLink->getFile()?->getExtension());
+			$file = $this->externalLink->getFile();
+			$viewerSource = $this->externalLink->isSpecificVersion()
+				? $this->externalLink->getVersion()
+				: $file;
+			$version = $viewerSource instanceof Version ? $viewerSource : null;
+			$isDocument = $viewerSource !== null && $this->isViewableDocument($viewerSource->getExtension());
 
 			// Html is answered before the board and office branches, the order the unified link keeps in
 			// HtmlRenderableFileHandlerFactory: the same decision is made twice, so it is made the same
@@ -509,7 +521,7 @@ class CDiskExternalLinkComponent extends DiskComponent
 
 			if ($this->isBoardsHandler() && $passwordPassed && $isDocument)
 			{
-				$documentSession = $this->generateDocumentSession($this->externalLink->getFile());
+				$documentSession = $this->generateDocumentSession($this->externalLink->getFile(), $version);
 
 				if (!$documentSession)
 				{
@@ -532,7 +544,10 @@ class CDiskExternalLinkComponent extends DiskComponent
 			$documentViewer = $this->resolveDocumentViewer($this->defaultHandlerForView);
 			if ($documentViewer !== null && $passwordPassed && $isDocument)
 			{
-				$documentSession = $this->generateDocumentSession($this->externalLink->getFile());
+				$documentSession = $this->generateDocumentSession(
+					$this->externalLink->getFile(),
+					$version,
+				);
 				if (!$documentSession)
 				{
 					$this->showNotFoundPage();
@@ -637,7 +652,7 @@ class CDiskExternalLinkComponent extends DiskComponent
 		return $this->externalLinkPasswordService->validateAndConfirm($this->externalLink, $password);
 	}
 
-	private function generateDocumentSession(File $file): ?DocumentSession
+	private function generateDocumentSession(File $file, ?Version $version = null): ?DocumentSession
 	{
 		$documentSessionContext = new DocumentSessionContext($file->getId(), null, $this->externalLink->getId());
 		$service = $this->getSessionServiceByFile($file);
@@ -655,10 +670,7 @@ class CDiskExternalLinkComponent extends DiskComponent
 			->setSessionContext($documentSessionContext)
 			->setService($service)
 		;
-		if (!$this->setDocumentSessionSource($sessionManager, $file))
-		{
-			return null;
-		}
+		$this->setDocumentSource($sessionManager, $file, $version);
 
 		if (!$sessionManager->lock())
 		{
@@ -675,24 +687,12 @@ class CDiskExternalLinkComponent extends DiskComponent
 		}
 	}
 
-	protected function setDocumentSessionSource(SessionManager $sessionManager, File $file): bool
+	private function setDocumentSource(SessionManager $sessionManager, File $file, ?Version $version = null): void
 	{
-		if (!$this->externalLink->isSpecificVersion())
-		{
-			$sessionManager->setFile($file);
-
-			return true;
-		}
-
-		$version = $file->getVersion($this->externalLink->getVersionId());
-		if (!$version || $version->getObjectId() !== $file->getRealObjectId())
-		{
-			return false;
-		}
-
-		$sessionManager->setVersion($version);
-
-		return true;
+		$sessionManager
+			->setFile($file)
+			->setVersion($version)
+		;
 	}
 
 	private function getSessionType(): int
@@ -1039,10 +1039,24 @@ class CDiskExternalLinkComponent extends DiskComponent
 			return null;
 		}
 
+		$version = null;
+		if ($this->externalLink->isSpecificVersion())
+		{
+			$version = $this->externalLink->getVersion();
+			if ($version === null)
+			{
+				return null;
+			}
+		}
+
+		$viewerSource = $version ?? $file;
+		$viewerSourceName = $viewerSource->getName();
+		$viewerSourceTime = $version?->getCreateTime() ?? $file->getUpdateTime();
+
 		$result = array(
 			'ID' => $file->getId(),
-			'IS_IMAGE' => TypeFile::isImage($file),
-			'IS_DOCUMENT' => TypeFile::isDocument($file->getName()),
+			'IS_IMAGE' => TypeFile::isImage($version === null ? $file : $viewerSourceName),
+			'IS_DOCUMENT' => TypeFile::isDocument($viewerSourceName),
 			'ICON_CLASS' => Icon::getIconClassByObject($file),
 			'ICON_NAME' => Icon::getIconSetNameByFile($file),
 			'UPDATE_TIME' => $file->getUpdateTime(),
@@ -1079,7 +1093,7 @@ class CDiskExternalLinkComponent extends DiskComponent
 
 		if ($result['IS_IMAGE'])
 		{
-			$fileData = $file->getFile();
+			$fileData = $viewerSource->getFile();
 			if ($fileData)
 			{
 				$result['IMAGE_DIMENSIONS'] = array(
@@ -1088,7 +1102,7 @@ class CDiskExternalLinkComponent extends DiskComponent
 				);
 			}
 		}
-		elseif ($file->getView()->getData())
+		elseif ($this->isTiffFile($viewerSource) || $viewerSource->getView()->getData())
 		{
 			CJSCore::Init('disk');
 			$viewUrl = array(
@@ -1096,7 +1110,7 @@ class CDiskExternalLinkComponent extends DiskComponent
 					'hash' => $this->externalLink->getHash(),
 					'action' => 'showView',
 					'token' => $this->downloadToken,
-					'ts' => $file->getUpdateTime()->getTimestamp(),
+					'ts' => $viewerSourceTime->getTimestamp(),
 					'ncc' => 1,
 				)),
 				$this->getUrlManager()->getUrlExternalLink(array(
@@ -1108,7 +1122,10 @@ class CDiskExternalLinkComponent extends DiskComponent
 
 			$height = 520;
 			$width = 720;
-			if ($file->getView() instanceof \Bitrix\Disk\View\Video && !$file->getView()->getPreviewData())
+			if (
+				$viewerSource->getView() instanceof \Bitrix\Disk\View\Video
+				&& !$viewerSource->getView()->getPreviewData()
+			)
 			{
 				$height = 400;
 				$width = 600;
@@ -1119,9 +1136,41 @@ class CDiskExternalLinkComponent extends DiskComponent
 				'token' => $this->downloadToken,
 			));
 
-			if ($file->getView() instanceof \Bitrix\Disk\View\Document)
+			if (
+				$this->isTiffFile($viewerSource)
+				|| $viewerSource->getView() instanceof \Bitrix\Disk\View\Document
+			)
 			{
-				$attributes = FileAttributes::tryBuildByFileId($file->getFileId(), $sourceUri);
+				$attributes = FileAttributes::tryBuildByFileId(
+					$viewerSource->getFileId(),
+					$sourceUri,
+					$version === null ? $file : null,
+				);
+				if ($version !== null)
+				{
+					$attributes
+						->setObjectId($file->getId())
+						->setVersionId($version->getId())
+						->setTitle($viewerSourceName)
+					;
+				}
+
+				if ($this->isTiffFile($viewerSource))
+				{
+					$attributes->setTiffPreviewUrlOverride(
+						$this->getUrlManager()->getUrlExternalLink([
+							'hash' => $this->externalLink->getHash(),
+							'action' => 'showTiffPreview',
+							'token' => $this->downloadToken,
+						]),
+					);
+				}
+				elseif ($file->supportsUnifiedLink())
+				{
+					$attributes->setTiffPreviewUrlParams([
+						'_uls' => (new Signer())->getSignature((string)$file->getId()),
+					]);
+				}
 				$attributes
 					->unsetAttribute('data-viewer')
 					->setAttribute('data-inline-viewer')
@@ -1133,7 +1182,7 @@ class CDiskExternalLinkComponent extends DiskComponent
 			}
 			else
 			{
-				$result['VIEWER'] = $file->getView()->render(array(
+				$result['VIEWER'] = $viewerSource->getView()->render(array(
 					'PATH' => $viewUrl,
 					'HEIGHT' => $height,
 					'WIDTH' => $width,
@@ -1142,23 +1191,33 @@ class CDiskExternalLinkComponent extends DiskComponent
 			}
 
 		}
-		elseif ($result['IS_DOCUMENT'] && $this->canMakePreview($file))
+		elseif ($result['IS_DOCUMENT'] && $this->canMakePreview($viewerSource))
 		{
 			$result['PREVIEW'] = array(
-				'VIEW_URL' => $this->getDocumentPreviewUrl($file),
+				'VIEW_URL' => $this->getDocumentPreviewUrl($file, $version),
 			);
 		}
 
 		return $result;
 	}
 
-	private function getDocumentPreviewData(File $file)
+	private function isTiffFile(File|Version $file): bool
 	{
+		$extension = mb_strtolower(getFileExtension($file->getName()));
+
+		return in_array($extension, ['tif', 'tiff'], true)
+			&& Configuration::isEnabledFileViewerFormats();
+	}
+
+	private function getDocumentPreviewData(File $file, ?Version $version = null)
+	{
+		$fileName = $version?->getName() ?? $file->getName();
 		$fileData = new \Bitrix\Disk\Document\FileData();
 		$fileData
 			->setFile($file)
-			->setName($file->getName())
-			->setMimeType(TypeFile::getMimeTypeByFilename($file->getName()))
+			->setVersion($version)
+			->setName($fileName)
+			->setMimeType(TypeFile::getMimeTypeByFilename($fileName))
 		;
 
 		$dataForViewFile = $this->defaultHandlerForView->getDataForViewFile($fileData);
@@ -1170,9 +1229,9 @@ class CDiskExternalLinkComponent extends DiskComponent
 		return $dataForViewFile;
 	}
 
-	private function getDocumentPreviewUrl(File $file)
+	private function getDocumentPreviewUrl(File $file, ?Version $version = null)
 	{
-		$documentPreviewData = $this->getDocumentPreviewData($file);
+		$documentPreviewData = $this->getDocumentPreviewData($file, $version);
 		if (!$documentPreviewData)
 		{
 			return null;
@@ -1181,7 +1240,7 @@ class CDiskExternalLinkComponent extends DiskComponent
 		return $documentPreviewData['viewUrl'];
 	}
 
-	private function canMakePreview(File $file)
+	private function canMakePreview(File|Version $file)
 	{
 		if ($file->getSize() > self::MAX_SIZE_TO_PREVIEW)
 		{
@@ -1470,6 +1529,86 @@ class CDiskExternalLinkComponent extends DiskComponent
 	protected function processActionShowPreview()
 	{
 		$this->processActionDownload(true, true);
+	}
+
+	protected function processActionShowTiffPreview(): void
+	{
+		$file = $this->externalLink->getFile();
+		if (!$file)
+		{
+			$this->showNotFoundPage();
+
+			return;
+		}
+
+		$previewSource = $this->externalLink->isSpecificVersion()
+			? $this->externalLink->getVersion()
+			: $file;
+		if ($previewSource === null || !$this->isTiffFile($previewSource))
+		{
+			$this->showNotFoundPage();
+
+			return;
+		}
+
+		$this->downloadToken = (string)$this->request->getQuery('token');
+
+		$urlManager = $this->getUrlManager();
+		$previewActionUrl = $urlManager->getUrlExternalLink([
+			'hash' => $this->externalLink->getHash(),
+			'action' => 'showTiffPreview',
+			'token' => $this->downloadToken,
+		]);
+		$showFileUrl = $urlManager->getUrlExternalLink([
+			'hash' => $this->externalLink->getHash(),
+			'action' => 'showFile',
+			'token' => $this->downloadToken,
+		]);
+
+		$result = (new TiffPreviewService())->getByExternalLink(
+			$previewSource,
+			(string)$this->getDownloadUrl(),
+			$previewActionUrl,
+			$showFileUrl,
+			$this->getTiffPreviewToken(),
+		);
+
+		if (!$result->isSuccess())
+		{
+			$error = $result->getError();
+			$this->sendTiffPreviewResponse([
+				'status' => PreviewStatus::ERROR,
+				'previewUrl' => null,
+				'downloadUrl' => $this->getDownloadUrl(),
+				'errorCode' => $error?->getCode() ?: ErrorCode::CONVERSION_FAILED,
+				'message' => $error?->getMessage(),
+			]);
+		}
+
+		$data = $result->getData();
+		$response = $data['response'] ?? null;
+		if ($response instanceof \Bitrix\Main\Response)
+		{
+			Application::getInstance()->end(0, $response);
+		}
+
+		$this->sendTiffPreviewResponse($data);
+	}
+
+	private function sendTiffPreviewResponse(array $data): void
+	{
+		$this->sendJsonResponse([
+			'status' => self::STATUS_SUCCESS,
+			'data' => $data,
+			'errors' => [],
+		]);
+	}
+
+	private function getTiffPreviewToken(): ?string
+	{
+		$previewToken = $this->request->getQuery('previewToken');
+
+		return is_string($previewToken) && $previewToken !== '' ? $previewToken : null;
 	}
 
 	protected function processActionShowView($path = '/', $fileId = null)

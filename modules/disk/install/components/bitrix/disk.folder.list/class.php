@@ -433,6 +433,18 @@ class CDiskFolderListComponent extends DiskComponent implements Controllerable
 					$showFileResult['markdownUrl'] = (string)$markdownUri;
 				}
 
+				$tiffPreviewUrl = $attr->getAttribute(FileAttributes::ATTRIBUTE_TIFF_PREVIEW_URL);
+				if (is_string($tiffPreviewUrl) && $tiffPreviewUrl !== '')
+				{
+					$tiffPreviewUri = new Uri($tiffPreviewUrl);
+
+					$tiffPreviewUri->addParams([
+						'_uls' => $uls,
+					]);
+
+					$showFileResult['tiffPreviewUrl'] = (string)$tiffPreviewUri;
+				}
+
 				$this->arResult['SHOW_FILE'] = $showFileResult;
 			}
 		}

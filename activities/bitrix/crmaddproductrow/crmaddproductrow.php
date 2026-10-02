@@ -222,6 +222,12 @@ class CBPCrmAddProductRow extends CBPActivity
 	{
 		if (isset($row['DISCOUNT_RATE']))
 		{
+			if ((float)$row['DISCOUNT_RATE'] === 100.0)
+			{
+				$taxRate = (float)($row['TAX_RATE'] ?? 0);
+				$row['DISCOUNT_SUM'] = Crm\Service\Accounting::calculatePriceExcludingTax((float)$price, $taxRate);
+			}
+
 			$price = Crm\Discount::calculatePrice($price, $row['DISCOUNT_RATE']);
 		}
 

@@ -24,6 +24,8 @@ use Bitrix\Main\ErrorCollection;
 use Bitrix\Main\Provider\Params\GridParams;
 use Bitrix\Main\Provider\Params\Pager;
 use Bitrix\Main\UI\Filter\Options;
+use Bitrix\UI\Buttons;
+use Bitrix\UI\Toolbar\ButtonLocation;
 use Bitrix\UI\Toolbar\Facade\Toolbar;
 
 class BizprocStorageListComponent extends CBitrixComponent
@@ -31,6 +33,7 @@ class BizprocStorageListComponent extends CBitrixComponent
 	private const GRID_ID = 'bizproc-storage-list';
 	private const DEFAULT_PAGE_SIZE = 50;
 	private const DEFAULT_OFFSET = 0;
+	private const CREATED_STORAGE_ID_PARAM = 'createdStorageId';
 
 	private ErrorCollection $errorCollection;
 
@@ -87,20 +90,34 @@ class BizprocStorageListComponent extends CBitrixComponent
 		$provider = new StorageTypeProvider();
 
 		$totalCount = $provider->getCount($filter);
-		$grid->getPagination()?->setRecordCount($totalCount);
 
 		$gridSort = $grid->getOptions()->getSorting([
 			'sort' => ['ID' => 'ASC'],
 		]);
+		$sort = new StorageTypeSort($gridSort['sort']);
 
 		$pagination = $grid->getPagination();
+		if ($pagination !== null)
+		{
+			$pagination->setRecordCount($totalCount);
+
+			$lastExistingPage = max($pagination->getPageCount(), 1);
+			if ($pagination->getCurrentPage() > $lastExistingPage)
+			{
+				$pagination->setCurrentPage($lastExistingPage);
+				$grid->savePagination($pagination);
+			}
+
+			$this->switchToCreatedStoragePage($grid, $provider, $filter, $sort);
+		}
+
 		$gridParams = new GridParams(
 			pager: new Pager(
 				limit: $pagination?->getLimit() ?? self::DEFAULT_PAGE_SIZE,
 				offset: $pagination?->getOffset() ?? self::DEFAULT_OFFSET,
 			),
 			filter: $filter,
-			sort: new StorageTypeSort($gridSort['sort']),
+			sort: $sort,
 		);
 
 		$collection = $provider->getList($gridParams);
@@ -124,6 +141,18 @@ class BizprocStorageListComponent extends CBitrixComponent
 		{
 			Toolbar::deleteFavoriteStar();
 			Toolbar::addFilter($storageListFilter->getOptions(self::GRID_ID));
+
+			$createButton = new Buttons\CreateButton([
+				'text' => Loc::getMessage('BIZPROC_STORAGE_LIST_CREATE_BUTTON') ?? '',
+				'color' => Buttons\Color::PRIMARY,
+				'dataset' => [
+					'testid' => 'bizproc-storage-list-create-btn',
+				],
+				'click' => new Buttons\JsCode(
+					"BX.Bizproc.Component.StorageList.Instance?.createStorage();"
+				),
+			]);
+			Toolbar::addButton($createButton, ButtonLocation::AFTER_TITLE);
 		}
 
 			$this->arResult['GRID_PARAMS'] = [
@@ -135,6 +164,28 @@ class BizprocStorageListComponent extends CBitrixComponent
 				'SHOW_ACTION_PANEL' => true,
 			];
 		$this->includeComponentTemplate();
+	}
+
+	private function switchToCreatedStoragePage(
+		StorageListGrid $grid,
+		StorageTypeProvider $provider,
+		StorageTypeFilter $filter,
+		StorageTypeSort $sort,
+	): void
+	{
+		$createdStorageId = (int)$this->request->getPost(self::CREATED_STORAGE_ID_PARAM);
+		if ($createdStorageId <= 0)
+		{
+			return;
+		}
+
+		$position = $provider->getPosition($createdStorageId, $filter, $sort);
+		if ($position === null)
+		{
+			return;
+		}
+
+		$grid->switchToPageOfPosition($position);
 	}
 
 	private function buildGridActions(): array

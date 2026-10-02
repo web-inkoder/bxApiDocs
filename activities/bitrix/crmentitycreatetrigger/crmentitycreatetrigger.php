@@ -3,13 +3,11 @@
 declare(strict_types=1);
 
 use Bitrix\Bizproc\FieldType;
-use Bitrix\Bizproc\Activity\Enum\ActivityGroup;
 use Bitrix\Bizproc\Public\Activity\ReturnDocumentTrait;
-use Bitrix\Bizproc\Public\Entity\Trigger\Section;
-use Bitrix\Crm\Service\Container;
-use Bitrix\Main\Loader;
+use Bitrix\Crm\Integration\BizProc\Activity\Mixins\EventInitiatorTrait;
+use Bitrix\Crm\Integration\BizProc\Trigger\CrmEntityTriggerTrait;
 use Bitrix\Main\Localization\Loc;
-use Bitrix\Ui\Public\Enum\IconSet\Outline;
+use Bitrix\Main\Type\DateTime;
 
 if (!defined('B_PROLOG_INCLUDED') || B_PROLOG_INCLUDED !== true)
 {
@@ -21,11 +19,21 @@ if (!CBPRuntime::getRuntime()->includeActivityFile('CreateDocumentTrigger'))
 	return;
 }
 
+if (!\Bitrix\Main\Loader::includeModule('crm'))
+{
+	return;
+}
+
 class CBPCrmEntityCreateTrigger extends CBPCreateDocumentTrigger
 {
+	use CrmEntityTriggerTrait;
+	use EventInitiatorTrait;
 	use ReturnDocumentTrait;
 
-	private const PARAM_CATEGORY_ID = 'categoryId';
+	private const EVENT_INITIATOR_ID = 'Initiator';
+	private const EVENT_DATE_TIME_ID = 'EventDateTime';
+	private const RETURN_ENTITY_TYPE_ID = 'EntityTypeId';
+	private const RETURN_ENTITY_ID = 'EntityId';
 
 	public function __construct($name)
 	{
@@ -34,15 +42,32 @@ class CBPCrmEntityCreateTrigger extends CBPCreateDocumentTrigger
 		$this->arProperties['Document'] = '';
 		$this->arProperties['ReturnDocument'] = null;
 		$this->arProperties['IsAutomatedSolution'] = 'N';
-		$this->arProperties[self::PARAM_CATEGORY_ID] = null;
+		$this->arProperties[self::CATEGORY_ID_PROPERTY] = null;
+		$this->arProperties[self::EVENT_INITIATOR_ID] = null;
+		$this->arProperties[self::EVENT_DATE_TIME_ID] = null;
+
+		$this->setPropertiesTypes([
+			self::EVENT_INITIATOR_ID => ['Type' => FieldType::USER],
+			self::EVENT_DATE_TIME_ID => ['Type' => FieldType::DATETIME],
+		]);
 	}
 
 	public function execute(): int
 	{
-		$document = $this->getEventData()['Document'] ?? null;
+		parent::execute();
 
-		$this->setProperties([static::getReturnDocumentFieldName() => $document]);
-		$this->setPropertiesTypes(static::buildReturnDocumentProperties(is_array($document) ? $document : null));
+		$document = $this->getEventData()['Document'] ?? null;
+		$initiatorUserId = $this->resolveEventInitiatorUserId();
+
+		$this->setProperties([
+			static::getReturnDocumentFieldName() => $document,
+			self::EVENT_INITIATOR_ID => $initiatorUserId ? 'user_' . $initiatorUserId : null,
+			self::EVENT_DATE_TIME_ID => (new DateTime())->format(DateTime::getFormat()),
+			...static::buildReturnValues(is_array($document) ? $document : null),
+		]);
+		$this->setPropertiesTypes(
+			static::buildReturnProperties(is_array($document) ? $document : null)
+		);
 
 		return CBPActivityExecutionStatus::Closed;
 	}
@@ -53,471 +78,54 @@ class CBPCrmEntityCreateTrigger extends CBPCreateDocumentTrigger
 		array $currentValues,
 	): array
 	{
-		$properties['Return'] = static::buildReturnDocumentProperties(
-			static::resolveDocumentTypeFromDocument((string)($properties['Document'] ?? ''))
+		$document = static::resolveDocumentTypeFromDocument((string)($properties['Document'] ?? ''));
+
+		$properties['Return'] = static::buildReturnProperties(
+			$document,
 		);
 
 		return $properties;
 	}
 
-	public static function getPropertiesMap(array $documentType, array $context = []): array
+	private static function buildReturnProperties(?array $document): array
 	{
-		$document = (string)($context['Properties']['Document'] ?? $context['Document'] ?? '');
-		$isAutomatedSolution = CBPHelper::getBool(
-			$context['Properties']['IsAutomatedSolution'] ?? $context['IsAutomatedSolution'] ?? 'N'
-		);
-
-		$map = ['Document' => static::getDocumentPropertyMap($document, $isAutomatedSolution)];
-
-		if ($isAutomatedSolution)
-		{
-			$map['IsAutomatedSolution'] = [
-				'Name' => '',
-				'FieldName' => 'IsAutomatedSolution',
-				'Type' => FieldType::BOOL,
-				'Multiple' => false,
-				'Required' => false,
-				'Default' => 'Y',
-				'Hidden' => true,
-				'AllowSelection' => false,
-			];
-		}
-
-		if (static::shouldRenderCategoryField($document))
-		{
-			$map[self::PARAM_CATEGORY_ID] = [
-				'Name' => Loc::getMessage('BP_CRM_ENTITY_CREATE_TRIGGER_CATEGORY_ID'),
-				'FieldName' => self::PARAM_CATEGORY_ID,
-				'Type' => FieldType::SELECT,
-				'Required' => false,
-				'AllowSelection' => false,
-				'Options' => static::getCategoryOptions($document),
-			];
-		}
-
-		return $map;
-	}
-
-	private static function getDocumentPropertyMap(string $document, bool $isAutomatedSolution): array
-	{
-		$map = [
-			'Name' => static::getDefaultReturnDocumentTitle(),
-			'FieldName' => 'Document',
-			'Type' => FieldType::DOCUMENT_TYPE,
-			'Multiple' => false,
-			'Required' => true,
-			'AllowSelection' => false,
-			'Settings' => [
-				'entity' => [
-					'options' => [
-						'moduleIds' => ['crm'],
-						'crm' => ['onlyBizProcEnabled' => true],
-					],
-				],
+		return [
+			...static::buildReturnDocumentProperties($document),
+			self::RETURN_ENTITY_TYPE_ID => [
+				'Name' => Loc::getMessage('BP_CRM_ENTITY_CREATE_TRIGGER_ENTITY_TYPE_ID'),
+				'Type' => FieldType::INT,
+				'Default' => static::resolveEntityTypeIdByDocumentType($document),
+			],
+			self::RETURN_ENTITY_ID => [
+				'Name' => Loc::getMessage('BP_CRM_ENTITY_CREATE_TRIGGER_ENTITY_ID'),
+				'Type' => FieldType::INT,
+				'Default' => null,
 			],
 		];
-
-		$type = static::resolveDocumentTypeName($document);
-
-		if (in_array($type, static::getPresetEntityNames(), true))
-		{
-			$map['Hidden'] = true;
-			$map['Settings']['entity']['options']['crm']['onlyEntities'] = [$type];
-		}
-		elseif ($isAutomatedSolution)
-		{
-			$map['Settings']['entity']['options']['crm']['onlyAutomatedSolution'] = true;
-		}
-		else
-		{
-			$map['Settings']['entity']['options']['crm']['onlyDynamic'] = true;
-		}
-
-		return $map;
 	}
 
-	public static function validateProperties($arTestProperties = [], CBPWorkflowTemplateUser $user = null): array
+	private static function buildReturnValues(?array $document): array
 	{
-		$errors = [];
-
-		if (\CBPHelper::isEmptyValue($arTestProperties['Document'] ?? null))
+		if (!$document)
 		{
-			$errors[] = [
-				'code' => 'Document',
-				'message' => Loc::getMessage('BPFCT_DOCUMENT_EMPTY'),
+			return [
+				self::RETURN_ENTITY_TYPE_ID => null,
+				self::RETURN_ENTITY_ID => null,
 			];
 		}
 
-		return array_merge($errors, CBPActivity::validateProperties($arTestProperties, $user));
-	}
-
-	public function checkApplyRules(
-		array $rules,
-		\Bitrix\Bizproc\Activity\Trigger\TriggerParameters $parameters,
-	): \Bitrix\Bizproc\Result
-	{
-		$expectedEntityTypeId = static::resolveEntityTypeId($this->getActivityProperty('Document'));
-		$actualEntityTypeId = static::resolveEntityTypeId($parameters->get('Document'));
-		if ($expectedEntityTypeId <= 0 || $expectedEntityTypeId !== $actualEntityTypeId)
-		{
-			return \Bitrix\Bizproc\Result::createError(new \Bitrix\Bizproc\Error('entity type mismatch'));
-		}
-
-		$expectedCategoryId = static::normalizeCategoryId($this->getActivityProperty(self::PARAM_CATEGORY_ID));
-		if ($expectedCategoryId === null)
-		{
-			return \Bitrix\Bizproc\Result::createOk();
-		}
-
-		$actualCategoryId = static::normalizeCategoryId(
-			$parameters->get('CategoryId') ?? $parameters->get(self::PARAM_CATEGORY_ID),
-		);
-
-		return
-			$expectedCategoryId === $actualCategoryId
-				? \Bitrix\Bizproc\Result::createOk()
-				: \Bitrix\Bizproc\Result::createError(new \Bitrix\Bizproc\Error('category mismatch'))
-		;
-	}
-
-	protected function getSection(): ?Section
-	{
-		$entityTypeId = static::resolveEntityTypeId($this->getActivityProperty('Document'));
-		if ($entityTypeId <= 0)
-		{
-			return null;
-		}
-
-		return new Section(
-			static::getModuleId() . '|' . CCrmOwnerType::ResolveName($entityTypeId),
-			($categoryId = static::normalizeCategoryId($this->getActivityProperty(self::PARAM_CATEGORY_ID))) !== null
-				? (string)$categoryId
-				: null,
-		);
-	}
-
-	protected static function getModuleId(): string
-	{
-		return 'crm';
-	}
-
-	protected function getDocumentComplexType(): array
-	{
-		$complexType = parent::getDocumentComplexType();
-		$document = $this->getRawProperty('Document');
-		$documentType = static::resolveDocumentTypeFromDocument(
-			$document && CBPHelper::hasStringRepresentation($document) ? (string)$document : null
-		);
-
-		return $documentType ?: $complexType;
-	}
-
-	private static function getCategoryOptions(mixed $document): array
-	{
-		if (!Loader::includeModule(static::getModuleId()))
-		{
-			return [];
-		}
-
-		$entityTypeId = static::resolveEntityTypeId($document);
-		if ($entityTypeId <= 0)
-		{
-			return [];
-		}
-
-		$factory = Container::getInstance()->getFactory($entityTypeId);
-		if (
-			!$factory
-			|| !$factory->isCategoriesEnabled()
-			|| !$factory->isStagesEnabled()
-		)
-		{
-			return [];
-		}
-
-		$options = [];
-		foreach ($factory->getCategories() as $category)
-		{
-			$options[$category->getId()] = $category->getName();
-		}
-
-		return $options;
-	}
-
-	private static function getPresetEntityNames(): array
-	{
-		if (!Loader::includeModule('crm'))
-		{
-			return [];
-		}
+		[$entityTypeId, $entityId] = CCrmBizProcHelper::resolveEntityId($document);
 
 		return [
-			CCrmOwnerType::DealName,
-			CCrmOwnerType::CompanyName,
-			CCrmOwnerType::OrderName,
-			CCrmOwnerType::ContactName,
-			CCrmOwnerType::LeadName,
-			CCrmOwnerType::QuoteName,
-			CCrmOwnerType::SmartInvoiceName,
+			self::RETURN_ENTITY_TYPE_ID => (int)$entityTypeId > 0 ? (int)$entityTypeId : null,
+			self::RETURN_ENTITY_ID => (int)$entityId > 0 ? (int)$entityId : null,
 		];
 	}
 
-	private static function shouldRenderCategoryField(string $document): bool
+	private static function resolveEntityTypeIdByDocumentType(?array $document): ?int
 	{
-		if ($document === '')
-		{
-			return true;
-		}
+		$entityTypeId = (int)CCrmOwnerType::ResolveID((string)($document[2] ?? ''));
 
-		if (!in_array(static::resolveDocumentTypeName($document), static::getPresetEntityNames(), true))
-		{
-			return true;
-		}
-
-		$entityTypeId = static::resolveEntityTypeId($document);
-		if ($entityTypeId <= 0)
-		{
-			return false;
-		}
-
-		$factory = Container::getInstance()->getFactory($entityTypeId);
-
-		return $factory && $factory->isCategoriesEnabled() && $factory->isStagesEnabled();
-	}
-
-	private static function resolveEntityTypeId(mixed $document): int
-	{
-		if (is_array($document) && count($document) === 3)
-		{
-			[$entityTypeId] = CCrmBizProcHelper::resolveEntityId($document);
-
-			return (int)$entityTypeId;
-		}
-
-		if (!is_string($document) || $document === '')
-		{
-			return 0;
-		}
-
-		$documentType = static::resolveDocumentTypeFromDocument($document);
-		if (!$documentType)
-		{
-			return 0;
-		}
-
-		return (int)CCrmOwnerType::ResolveID((string)$documentType[2]);
-	}
-
-	private static function normalizeCategoryId(mixed $categoryId): ?int
-	{
-		if (is_array($categoryId))
-		{
-			$categoryId = reset($categoryId);
-		}
-
-		if ($categoryId === '' || $categoryId === null)
-		{
-			return null;
-		}
-
-		return (int)$categoryId;
-	}
-
-	protected static function resolveDocumentTypeFromDocument(?string $document): ?array
-	{
-		if (!$document || !Loader::includeModule('crm'))
-		{
-			return null;
-		}
-
-		if (str_contains($document, '@'))
-		{
-			return explode('@', $document);
-		}
-
-		return CCrmBizProcHelper::resolveDocumentType(CCrmOwnerType::resolveID($document));
-	}
-
-	private static function resolveDocumentTypeName(string $document): string
-	{
-		$complexDocumentType = static::resolveDocumentTypeFromDocument($document);
-
-		return $complexDocumentType ? (string)$complexDocumentType[2] : $document;
-	}
-
-	public static function getAjaxResponse($request): array
-	{
-		$document = $request['document'] ?? null;
-		if (!is_string($document) || $document === '')
-		{
-			return [];
-		}
-
-		return static::getCategoryOptions($document);
-	}
-
-	private function getActivityProperty(string $name): mixed
-	{
-		return array_key_exists($name, $this->arProperties)
-			? $this->arProperties[$name]
-			: $this->getRawProperty($name);
-	}
-
-	public static function getPresets(): array
-	{
-		Loader::includeModule('ui');
-
-		$presets = [
-			[
-				'ID' => 'DEAL',
-				'NAME' => Loc::getMessage('BP_CRM_DEAL_CREATE_FCT_DESCR_NAME'),
-				'DESCRIPTION' => Loc::getMessage('BP_CRM_DEAL_CREATE_FCT_DESCR_DESCR'),
-				'PROPERTIES' => ['Document' => 'crm@CCrmDocumentDeal@DEAL'],
-				'NODE_ICON' => Outline::HANDSHAKE->name,
-				'GROUPS' => [ActivityGroup::STARTER->value, ActivityGroup::SALES_CRM->value],
-			],
-			[
-				'ID' => 'CONTACT',
-				'NAME' => Loc::getMessage('BP_CRM_CONTACT_CREATE_FCT_DESCR_NAME'),
-				'DESCRIPTION' => Loc::getMessage('BP_CRM_CONTACT_CREATE_FCT_DESCR_DESCR'),
-				'PROPERTIES' => ['Document' => 'crm@CCrmDocumentContact@CONTACT'],
-				'NODE_ICON' => Outline::CONTACT->name,
-				'GROUPS' => [
-					ActivityGroup::STARTER->value,
-					ActivityGroup::SALES_CRM->value,
-					ActivityGroup::CLIENT_BASE->value,
-				],
-			],
-			[
-				'ID' => 'COMPANY',
-				'NAME' => Loc::getMessage('BP_CRM_COMPANY_CREATE_FCT_DESCR_NAME'),
-				'DESCRIPTION' => Loc::getMessage('BP_CRM_COMPANY_CREATE_FCT_DESCR_DESCR'),
-				'PROPERTIES' => ['Document' => 'crm@CCrmDocumentCompany@COMPANY'],
-				'NODE_ICON' => Outline::COMPANY->name,
-				'GROUPS' => [
-					ActivityGroup::STARTER->value,
-					ActivityGroup::SALES_CRM->value,
-					ActivityGroup::CLIENT_BASE->value,
-				],
-			],
-			[
-				'ID' => 'LEAD',
-				'NAME' => Loc::getMessage('BP_CRM_LEAD_CREATE_FCT_DESCR_NAME'),
-				'DESCRIPTION' => Loc::getMessage('BP_CRM_LEAD_CREATE_FCT_DESCR_DESCR'),
-				'PROPERTIES' => ['Document' => 'crm@CCrmDocumentLead@LEAD'],
-				'NODE_ICON' => Outline::LEAD->name,
-				'GROUPS' => [
-					ActivityGroup::STARTER->value,
-					ActivityGroup::SALES_CRM->value,
-					ActivityGroup::LEAD->value,
-				],
-			],
-			[
-				'ID' => 'QUOTE',
-				'NAME' => Loc::getMessage('BP_CRM_QUOTE_CREATE_FCT_DESCR_NAME'),
-				'DESCRIPTION' => Loc::getMessage('BP_CRM_QUOTE_CREATE_FCT_DESCR_DESCR'),
-				'PROPERTIES' => ['Document' => 'crm@Bitrix\Crm\Integration\BizProc\Document\Quote@QUOTE'],
-				'NODE_ICON' => Outline::SUITCASE->name,
-				'GROUPS' => [ActivityGroup::STARTER->value, ActivityGroup::SALES_CRM->value],
-			],
-			[
-				'ID' => 'DYNAMIC',
-				'NAME' => Loc::getMessage('BP_CRM_DYNAMIC_CREATE_FCT_DESCR_NAME'),
-				'DESCRIPTION' => Loc::getMessage('BP_CRM_DYNAMIC_CREATE_FCT_DESCR_DESCR'),
-				'NODE_ICON' => Outline::SMART_PROCESS->name,
-				'GROUPS' => [ActivityGroup::STARTER->value],
-			],
-			[
-				'ID' => 'AUTOMATED_SOLUTION',
-				'NAME' => Loc::getMessage('BP_CRM_AUTOMATED_SOLUTION_CREATE_FCT_DESCR_NAME'),
-				'DESCRIPTION' => Loc::getMessage('BP_CRM_AUTOMATED_SOLUTION_CREATE_FCT_DESCR_DESCR'),
-				'PROPERTIES' => ['IsAutomatedSolution' => 'Y'],
-				'NODE_ICON' => Outline::SMART_PROCESS->name,
-				'GROUPS' => [ActivityGroup::STARTER->value, ActivityGroup::DIGITAL_WORKPLACE->value],
-			],
-		];
-
-		if (Loader::includeModule('crm') && \CCrmSaleHelper::isWithOrdersMode())
-		{
-			$presets[] = [
-				'ID' => 'ORDER',
-				'NAME' => Loc::getMessage('BP_CRM_ORDER_CREATE_FCT_DESCR_NAME'),
-				'DESCRIPTION' => Loc::getMessage('BP_CRM_ORDER_CREATE_FCT_DESCR_DESCR'),
-				'PROPERTIES' => ['Document' => 'crm@Bitrix\Crm\Integration\BizProc\Document\Order@ORDER'],
-				'NODE_ICON' => Outline::CHANGE_ORDER->name,
-				'GROUPS' => [
-					ActivityGroup::STARTER->value,
-					ActivityGroup::SALES_CRM->value,
-					ActivityGroup::PAYMENT->value,
-				],
-			];
-		}
-
-		if (Loader::includeModule('crm') && \Bitrix\Crm\Settings\InvoiceSettings::getCurrent()->isSmartInvoiceEnabled())
-		{
-			$presets[] = [
-				'ID' => 'SMART_INVOICE',
-				'NAME' => Loc::getMessage('BP_CRM_SMART_INVOICE_CREATE_FCT_DESCR_NAME'),
-				'DESCRIPTION' => Loc::getMessage('BP_CRM_SMART_INVOICE_CREATE_FCT_DESCR_DESCR'),
-				'PROPERTIES' => ['Document' => 'crm@Bitrix\Crm\Integration\BizProc\Document\SmartInvoice@SMART_INVOICE'],
-				'NODE_ICON' => Outline::INVOICE->name,
-				'GROUPS' => [
-					ActivityGroup::STARTER->value,
-					ActivityGroup::SALES_CRM->value,
-					ActivityGroup::PAYMENT->value,
-				],
-			];
-		}
-
-		return $presets;
-	}
-
-	public static function getPresetById(string $presetId): ?array
-	{
-		foreach (static::getPresets() as $preset)
-		{
-			if ($preset['ID'] === $presetId)
-			{
-				return $preset;
-			}
-		}
-
-		return null;
-	}
-
-	public static function getPresetByComplexDocumentType(array $complexDocumentType): ?array
-	{
-		$presetId = static::getPresetIdByComplexDocumentType($complexDocumentType);
-
-		return $presetId ? static::getPresetById($presetId) : null;
-	}
-
-	private static function getPresetIdByComplexDocumentType(array $complexDocumentType): ?string
-	{
-		$entityTypeId = (int)CCrmOwnerType::ResolveID((string)($complexDocumentType[2] ?? ''));
-
-		return static::resolvePresetIdByEntityTypeId($entityTypeId);
-	}
-
-	private static function resolvePresetIdByEntityTypeId(int $entityTypeId): ?string
-	{
-		if (CCrmOwnerType::isPossibleDynamicTypeId($entityTypeId))
-		{
-			$factory = Container::getInstance()->getFactory($entityTypeId);
-
-			return $factory?->isInCustomSection() ? 'AUTOMATED_SOLUTION' : 'DYNAMIC';
-		}
-
-		return match (true)
-		{
-			$entityTypeId === CCrmOwnerType::Deal => 'DEAL',
-			$entityTypeId === CCrmOwnerType::Contact => 'CONTACT',
-			$entityTypeId === CCrmOwnerType::Company => 'COMPANY',
-			$entityTypeId === CCrmOwnerType::Lead => 'LEAD',
-			$entityTypeId === CCrmOwnerType::Quote => 'QUOTE',
-			$entityTypeId === CCrmOwnerType::Order => 'ORDER',
-			$entityTypeId === CCrmOwnerType::SmartInvoice => 'SMART_INVOICE',
-			default => null,
-		};
+		return $entityTypeId > 0 ? $entityTypeId : null;
 	}
 }

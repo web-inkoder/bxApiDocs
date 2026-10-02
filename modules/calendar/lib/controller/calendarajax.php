@@ -24,6 +24,7 @@ use Bitrix\Calendar\Rooms;
 use Bitrix\Calendar\Sharing;
 use Bitrix\Calendar\Ui\CalendarFilter;
 use Bitrix\Calendar\Util;
+use Bitrix\Calendar\View\EventViewData;
 use Bitrix\Intranet\Settings\Tools\ToolsManager;
 use Bitrix\Main\DI\ServiceLocator;
 use Bitrix\Main\Error;
@@ -920,6 +921,31 @@ class CalendarAjax extends \Bitrix\Main\Engine\Controller
 
 			$responseParams['section'] = isset($sections[0]) ? $sections[0] : null;
 
+			if (!$responseParams['section'])
+			{
+				$this->addError(new Error(Loc::getMessage('EC_EVENT_NOT_FOUND'), 'SECTION_NOT_FOUND'));
+
+				return [];
+			}
+
+			$permissions = \CCalendarEvent::getEventPermissions($entry, $userId);
+			$entry['permissions'] = $permissions;
+			$viewData = EventViewData::prepare(
+				$entry,
+				$responseParams['section'],
+				$permissions,
+				$responseParams['userIndex'],
+				$userId,
+			);
+			$entry = $viewData['entry'];
+			$responseParams['entry'] = $entry;
+			$responseParams['section'] = $viewData['section'];
+			$responseParams['userIndex'] = $viewData['userIndex'];
+			if ($viewData['restricted'])
+			{
+				$responseParams['entryUrl'] = '';
+			}
+
 			return new \Bitrix\Main\Engine\Response\Component(
 				'bitrix:calendar.view.slider',
 				'',
@@ -927,7 +953,9 @@ class CalendarAjax extends \Bitrix\Main\Engine\Controller
 					'id' => $uniqueId,
 					'event' => $entry,
 					'type' => \CCalendar::GetType(),
-					'sectionName' => $_REQUEST['section_name'],
+					'sectionName' => $viewData['restricted'] ? '' : $_REQUEST['section_name'],
+					'isRestrictedEventView' => $viewData['restricted'],
+					'userIndex' => $viewData['userIndex'],
 					'bIntranet' => \CCalendar::IsIntranetEnabled(),
 					'bSocNet' => \CCalendar::IsSocNet(),
 					'AVATAR_SIZE' => 21,
@@ -976,19 +1004,42 @@ class CalendarAjax extends \Bitrix\Main\Engine\Controller
 		$isExtranetUser = Loader::includeModule('intranet') && !\Bitrix\Intranet\Util::isIntranetUser($userId);
 
 		$hostId = (int)$request['hostId'];
-		if (!$hostId && $type === Dictionary::CALENDAR_TYPE['user'] && !$entryId)
+		if (!$entryId && $request['cur_event_id'])
 		{
-			$hostId = $ownerId;
+			$entryId = (int)$request['cur_event_id'];
+		}
+
+		if ($entryId > 0)
+		{
+			$event = \CCalendarEvent::GetById($entryId);
+			$hostId = $event ? (int)($event['MEETING_HOST'] ?? 0) : 0;
+			// The rights cost two reads and a batch check, so they are asked for the viewers alone
+			// who may not be told the host by their own relation to the event.
+			if ($hostId > 0 && $hostId !== $userId && !EventViewData::isOwnEntry($event, $userId))
+			{
+				$canReadFullEntry = EventViewData::canReadFullEntry(
+					$event,
+					\CCalendarEvent::getEventPermissions($event, $userId),
+					$userId,
+				);
+				$hostId = $canReadFullEntry ? $hostId : 0;
+			}
+		}
+		else
+		{
+			if (!$hostId && $type === Dictionary::CALENDAR_TYPE['user'])
+			{
+				$hostId = $ownerId ?: $userId;
+			}
+			elseif (!$hostId && $type !== Dictionary::CALENDAR_TYPE['open_event'])
+			{
+				$hostId = $userId;
+			}
 		}
 
 		if ($isExtranetUser)
 		{
 			$entries = \CExtranet::getMyGroupsUsersSimple(\CExtranet::GetExtranetSiteID());
-		}
-
-		if (!$entryId && $request['cur_event_id'])
-		{
-			$entryId = (int)$request['cur_event_id'];
 		}
 
 		$codes = [];

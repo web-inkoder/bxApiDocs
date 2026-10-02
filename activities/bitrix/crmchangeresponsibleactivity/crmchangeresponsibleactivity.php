@@ -85,10 +85,16 @@ class CBPCrmChangeResponsibleActivity extends CBPActivity implements IBPConfigur
 		if ($newResponsibleId)
 		{
 			$ds = $this->workflow->GetRuntime()->getDocumentService();
+			// Fall back to the workflow starter as the author when no
+			// explicit ModifiedBy. method_exists guards bizproc being older than crm.
+			$modifiedBy = method_exists($this, 'getModifiedByOrStarter')
+				? $this->getModifiedByOrStarter()
+				: $this->ModifiedBy
+			;
 			$ds->UpdateDocument(
 				$documentId,
 				[$responsibleFieldName => 'user_' . $newResponsibleId],
-				$this->ModifiedBy,
+				$modifiedBy,
 			);
 		}
 

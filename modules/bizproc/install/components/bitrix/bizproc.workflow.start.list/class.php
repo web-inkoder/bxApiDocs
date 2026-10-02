@@ -12,6 +12,7 @@ use Bitrix\Bizproc\Api\Request\WorkflowStateService\GetAverageWorkflowDurationRe
 use Bitrix\Bizproc\Api\Service\WorkflowStateService;
 use Bitrix\Bizproc\Internal\Container;
 use Bitrix\Bizproc\Internal\Service\Document\DocumentsResolver;
+use Bitrix\Bizproc\Public\Provider\PilotVisibilityProvider;
 use Bitrix\Bizproc\Workflow\Template\WorkflowTemplateUserOptionTable;
 use Bitrix\Main\Engine\Contract\Controllerable;
 use Bitrix\Main\Engine\CurrentUser;
@@ -486,6 +487,8 @@ class BizprocWorkflowStartList extends CBitrixComponent implements Errorable, Co
 		$order = array_merge(['PIN.ID' => 'DESC'], $this->getGridOrder());
 		$result->setOrder($order);
 
+		$this->applyPilotVisibilityFilter($result);
+
 		$documentsFilter = \Bitrix\Main\ORM\Query\Query::filter()->logic('or');
 		foreach ($documents as $index => $document)
 		{
@@ -493,6 +496,21 @@ class BizprocWorkflowStartList extends CBitrixComponent implements Errorable, Co
 		}
 
 		return $result->where($documentsFilter);
+	}
+
+	/**
+	 * The grid is a manual start point, so the templates a pilot acts on are narrowed to the ones the current
+	 * employee may see. The condition of the pilot has a key of its own and does not meet the ones the query
+	 * already carries, so it is simply added to them.
+	 */
+	private function applyPilotVisibilityFilter(\Bitrix\Main\ORM\Query\Query $query): void
+	{
+		$visibilityFilter = (new PilotVisibilityProvider())->getVisibilityFilter($this->getCurrentUserId());
+
+		foreach ($visibilityFilter as $field => $value)
+		{
+			$query->addFilter($field, $value);
+		}
 	}
 
 	private function getPinAction($template): array
@@ -821,12 +839,17 @@ class BizprocWorkflowStartList extends CBitrixComponent implements Errorable, Co
 			return $signedDocuments;
 		}
 
-		$documentType = CBPHelper::normalizeComplexDocumentId(
-			CBPDocument::unSignDocumentType($this->arParams['~signedDocumentType'] ?? '')
-		);
-		$documentId = CBPHelper::normalizeComplexDocumentId(
-			CBPDocument::unSignDocumentType($this->arParams['~signedDocumentId'] ?? '')
-		);
+		$unsignedDocumentType = CBPDocument::unSignDocumentType($this->arParams['~signedDocumentType'] ?? '');
+		$unsignedDocumentId = CBPDocument::unSignDocumentType($this->arParams['~signedDocumentId'] ?? '');
+
+		$documentType = is_array($unsignedDocumentType)
+			? CBPHelper::normalizeComplexDocumentId($unsignedDocumentType)
+			: null
+		;
+		$documentId = is_array($unsignedDocumentId)
+			? CBPHelper::normalizeComplexDocumentId($unsignedDocumentId)
+			: null
+		;
 
 		return ($documentType !== null && $documentId !== null)
 			? [[

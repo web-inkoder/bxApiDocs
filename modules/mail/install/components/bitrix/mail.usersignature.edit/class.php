@@ -1,10 +1,13 @@
 <?php
 
 use Bitrix\Mail\Dto\SharedSignatureDto;
+use Bitrix\Mail\Helper\Config\Feature;
+use Bitrix\Mail\Internal\Service\Signature\Template\Macro\SignatureMacroCatalog;
 use Bitrix\Mail\Internals\SharedSignatureAssignmentTable;
 use Bitrix\Mail\Internals\SharedSignatureTable;
 use Bitrix\Mail\Internals\UserSignatureTable;
 use Bitrix\Mail\Service\SharedSignature\AssignmentTargetDirectory;
+use Bitrix\Mail\Service\SharedSignature\SenderIdentityResolver;
 use Bitrix\Mail\Service\SharedSignature\SharedSignatureService;
 use Bitrix\Main\Engine\CurrentUser;
 use Bitrix\Main\Loader;
@@ -14,6 +17,8 @@ if (!defined('B_PROLOG_INCLUDED') || B_PROLOG_INCLUDED !== true) die();
 
 class MailUserSignatureEditComponent extends CBitrixComponent
 {
+	private int $unresolvedMailboxAssignmentId = 0;
+
 	public function onPrepareComponentParams($params)
 	{
 		$params = parent::onPrepareComponentParams($params);
@@ -34,17 +39,14 @@ class MailUserSignatureEditComponent extends CBitrixComponent
 		}
 
 		$this->arResult = [];
+		$this->arResult['showSignatureMacros'] = Feature::isSignatureMacrosAvailable();
+		$this->arResult['signatureMacroCatalog'] = $this->arResult['showSignatureMacros']
+			? (new SignatureMacroCatalog())->getDto()
+			: null
+		;
 		$this->arResult['IFRAME'] = $this->arParams['IFRAME'] == 'Y' || $this->request->get('IFRAME') == 'Y' ? 'Y' : 'N';
 
-		/*
-		 * Gate of the third card — the shared signature with its scope switcher. The interface
-		 * option of the shared signatures plus the right to manage them (tariff and RBAC). A plain
-		 * user gets false here and never receives the card: with it the editor stays personal-only.
-		 */
-		$this->arResult['showSharedSignatureCard'] =
-			SharedSignatureService::isSharedInterfaceEnabled()
-			&& SharedSignatureService::canManageSharedScope()
-		;
+		$this->arResult['showSharedSignatureCard'] = $this->canShowSharedSignatureCard();
 
 		$senders = $this->getSenders();
 		$this->arResult['senderType'] = null;
@@ -202,14 +204,45 @@ class MailUserSignatureEditComponent extends CBitrixComponent
 		$this->includeComponentTemplate();
 	}
 
+	protected function canShowSharedSignatureCard(): bool
+	{
+		return SharedSignatureService::isSharedInterfaceEnabled()
+			&& SharedSignatureService::canManageSharedScope()
+		;
+	}
+
 	protected function findSenderAssignment(array $assignments): string
 	{
+		$mailboxAssignments = [];
 		foreach ($assignments as $assignment)
 		{
 			if ((string)$assignment['TARGET_TYPE'] === SharedSignatureAssignmentTable::TARGET_SENDER)
 			{
 				return (string)($assignment['TARGET_VALUE'] ?? '');
 			}
+			if ((string)$assignment['TARGET_TYPE'] === SharedSignatureAssignmentTable::TARGET_MAILBOX)
+			{
+				$mailboxAssignments[(int)$assignment['TARGET_ID']] = $assignment;
+			}
+		}
+
+		$mailboxEmails = (new SenderIdentityResolver())->resolveMailboxEmails(
+			array_fill_keys(array_keys($mailboxAssignments), (int)CurrentUser::get()->getId()),
+		);
+		foreach ($mailboxAssignments as $mailboxId => $assignment)
+		{
+			$email = $mailboxEmails[$mailboxId] ?? '';
+			if ($email !== '')
+			{
+				$name = trim((string)($assignment['TARGET_VALUE'] ?? ''));
+
+				return $name === '' ? $email : sprintf('%s <%s>', $name, $email);
+			}
+		}
+
+		if ($mailboxAssignments !== [])
+		{
+			$this->unresolvedMailboxAssignmentId = (int)array_key_first($mailboxAssignments);
 		}
 
 		return '';
@@ -255,6 +288,15 @@ class MailUserSignatureEditComponent extends CBitrixComponent
 			],
 		];
 		$values = ['' => true];
+		if ($this->unresolvedMailboxAssignmentId > 0)
+		{
+			$options[] = [
+				'id' => 'mailbox-unavailable:' . $this->unresolvedMailboxAssignmentId,
+				'title' => Loc::getMessage('MAIL_USERSIGNATURE_SENDER_OPTION_MAILBOX_UNAVAILABLE'),
+				'value' => '',
+				'preserveAssignment' => true,
+			];
+		}
 
 		foreach ($formatedByEmail as $email => $formatedList)
 		{
@@ -296,7 +338,10 @@ class MailUserSignatureEditComponent extends CBitrixComponent
 
 		foreach ($options as &$option)
 		{
-			$option['selected'] = $option['value'] === $currentSender;
+			$option['selected'] = $this->unresolvedMailboxAssignmentId > 0
+				? ($option['preserveAssignment'] ?? false)
+				: $option['value'] === $currentSender
+			;
 		}
 		unset($option);
 

@@ -6,6 +6,7 @@ use Bitrix\Main;
 use Bitrix\Mail;
 use Bitrix\Mail\Helper\LicenseManager;
 use Bitrix\Mail\Helper\Config\Feature;
+use Bitrix\Mail\Helper\Label\LabelsFeature;
 
 
 \Bitrix\Main\UI\Extension::load('mail.messagegrid');
@@ -80,6 +81,7 @@ class CMailClientComponent extends CBitrixComponent
 				'blacklist'        => 'blacklist',
 				'signatures'       => 'signatures',
 				'signature'        => 'signature/#id#',
+				'labels'           => 'labels',
 				'msg_view'         => 'message/#id#',
 				'msg_list'         => 'list/#id#/#start_sync_with_showing_stepper#',
 				'config_dirs'      => 'config/dirs',
@@ -88,6 +90,7 @@ class CMailClientComponent extends CBitrixComponent
 				'massconnect'      => 'massconnect',
 				'config_permissions' => 'permissions',
 				'sentrequests'     => 'sentrequests',
+				'drafts'           => 'drafts',
 			);
 		}
 		else
@@ -99,6 +102,7 @@ class CMailClientComponent extends CBitrixComponent
 				'blacklist'        => 'page=blacklist',
 				'signatures'       => 'page=signatures',
 				'signature'        => 'page=signature&id=#id#',
+				'labels'           => 'page=labels',
 				'msg_view'         => 'page=msg_view&id=#id#',
 				'msg_list'         => 'page=msg_list&id=#id#&start_sync_with_showing_stepper=#start_sync_with_showing_stepper#',
 				'config_dirs'      => 'page=config_dirs',
@@ -107,12 +111,16 @@ class CMailClientComponent extends CBitrixComponent
 				'massconnect'      => 'page=massconnect',
 				'config_permissions' => 'page=permissions',
 				'sentrequests'     => 'page=sentrequests',
+				'drafts'           => 'page=drafts',
 			);
 		}
 
 		if ($this->arParams['SEF_MODE'] == 'Y')
 		{
-			$urlTemplates  = \CComponentEngine::makeComponentUrlTemplates($defaultUrlTemplates, $this->arParams['SEF_URL_TEMPLATES']);
+			$urlTemplates = \CComponentEngine::makeComponentUrlTemplates(
+				$defaultUrlTemplates,
+				$this->arParams['SEF_URL_TEMPLATES'] ?? []
+			);
 
 			$componentPage = \CComponentEngine::parseComponentPath($this->arParams['SEF_FOLDER'], $urlTemplates, $variables);
 
@@ -140,6 +148,16 @@ class CMailClientComponent extends CBitrixComponent
 		if ($componentPage === 'sentrequests' && !Feature::isPasswordlessConnectAvailable())
 		{
 			$componentPage = 'mbx_list';
+		}
+
+		if ($componentPage === 'drafts' && !Feature::isInternalDraftsWebAvailable())
+		{
+			$componentPage = 'home';
+		}
+
+		if ($componentPage === 'labels' && !LabelsFeature::isEnabled())
+		{
+			$componentPage = 'home';
 		}
 
 		$gridPages = ['mbx_list', 'massconnect', 'config_permissions', 'sentrequests'];
@@ -217,7 +235,14 @@ class CMailClientComponent extends CBitrixComponent
 			$this->arResult['ANALYTICS']['SOURCE'] = $validSource;
 		}
 
-		$this->includeComponentTemplate($componentPage);
+		$templatePage = $componentPage;
+		if ($componentPage === 'drafts')
+		{
+			$this->arResult['VARIABLES']['list_mode'] = 'drafts';
+			$templatePage = 'msg_list';
+		}
+
+		$this->includeComponentTemplate($templatePage);
 	}
 
 }

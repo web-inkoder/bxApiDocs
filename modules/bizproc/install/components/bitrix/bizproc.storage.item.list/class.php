@@ -6,6 +6,7 @@ if (!defined('B_PROLOG_INCLUDED') || B_PROLOG_INCLUDED !== true)
 }
 
 use Bitrix\Bizproc\Internal\Container;
+use Bitrix\Bizproc\Internal\Service\DocumentField\FieldValueFormatter;
 use Bitrix\Bizproc\Internal\Service\StorageField\FieldService;
 use Bitrix\Main\Localization\Loc;
 use Bitrix\Bizproc\Public\Provider\StorageItemProvider;
@@ -18,6 +19,7 @@ use Bitrix\Main\Loader;
 use Bitrix\Bizproc\Api\Enum\ErrorMessage;
 use Bitrix\Main\Grid\Options;
 use Bitrix\Main\UI\PageNavigation;
+use Bitrix\Main\DI\ServiceLocator;
 use Bitrix\Main\ErrorCollection;
 use Bitrix\Main\Application;
 use Bitrix\Main\Type\DateTime;
@@ -32,6 +34,8 @@ class BizprocStorageItemListComponent extends CBitrixComponent
 	protected const NAV_PARAM_NAME = 'storage-item-list';
 	protected const DEFAULT_PAGE_SIZE = 10;
 	protected int $storageTypeId = 0;
+	protected bool $isDataView = false;
+	private ?array $dataViewDefinition = null;
 	protected StorageItemProvider $storageItemProvider;
 	protected StorageTypeProvider $storageTypeProvider;
 	protected ErrorCollection $errorCollection;
@@ -40,6 +44,7 @@ class BizprocStorageItemListComponent extends CBitrixComponent
 	protected ?string $gridId = null;
 	protected ?array $userTypes = null;
 	protected FieldService $fieldService;
+	private ?array $fieldValueFormatters = null;
 
 	protected function init(): void
 	{
@@ -82,8 +87,23 @@ class BizprocStorageItemListComponent extends CBitrixComponent
 			return;
 		}
 
+		$this->isDataView = $this->resolveIsDataView();
+
 		$this->fieldService = new FieldService($this->storageTypeId);
 		$this->storageItemProvider = new StorageItemProvider($this->storageTypeId);
+	}
+
+	protected function resolveIsDataView(): bool
+	{
+		if (\Bitrix\Main\Config\Option::get('bizproc', 'dataview_enabled', 'N') !== 'Y')
+		{
+			return false;
+		}
+
+		$dataView = Container::getDataViewRepository()?->getByStorageTypeId($this->storageTypeId);
+		$this->dataViewDefinition = $dataView?->getDefinition();
+
+		return $dataView !== null;
 	}
 
 	public function executeComponent()
@@ -101,8 +121,7 @@ class BizprocStorageItemListComponent extends CBitrixComponent
 		$this->setTitle($title ?? Loc::getMessage('BIZPROC_STORAGE_ITEM_LIST_TITLE') ?? '');
 
 		$this->addToolbarButtons();
-//		$limitsService = Container::getStorageLimitsService();
-//		$this->arResult['quotaExceeded'] = !$limitsService->isDiskQuotaReadable();
+		$this->arResult['diskBannerState'] = Container::getStorageLimitsService()?->getBannerState();
 		$this->loadGridData();
 		$this->includeComponentTemplate();
 	}
@@ -174,6 +193,16 @@ class BizprocStorageItemListComponent extends CBitrixComponent
 			['id' => 'UPDATED_TIME', 'default' => true, 'sort' => 'UPDATED_TIME'],
 		];
 
+		if ($this->isDataView)
+		{
+
+			$serviceColumns = ['WORKFLOW_ID', 'DOCUMENT_ID', 'TEMPLATE_ID'];
+			$columns = array_values(array_filter(
+				$columns,
+				static fn(array $column): bool => !in_array($column['id'], $serviceColumns, true),
+			));
+		}
+
 		$fields = $this->fieldService->getDynamicFields();
 		if ($fields)
 		{
@@ -199,9 +228,10 @@ class BizprocStorageItemListComponent extends CBitrixComponent
 
 	/**
 	 * @param array $field
+	 * @param array<string, mixed> $presentedRow columnCode => humanized label overlay
 	 * @return array<string, mixed>
 	 */
-	protected function getFieldColumns(array $field): array
+	protected function getFieldColumns(array $field, array $presentedRow = []): array
 	{
 		$fieldColumns = [
 			'ID' => (int)$field['id'],
@@ -215,30 +245,39 @@ class BizprocStorageItemListComponent extends CBitrixComponent
 			'UPDATED_TIME' => $field['updatedAt'] ? DateTime::createFromTimestamp($field['updatedAt']) : null
 		];
 
-		$fields = $this->fieldService->getDynamicFields();
-		$documentService = CBPRuntime::GetRuntime(true)->getDocumentService();
-		$documentType = \Bitrix\Bizproc\Public\Entity\Document\Workflow::getComplexType();
-
-		if ($fields)
+		foreach ($this->getFieldValueFormatters() as $code => $formatter)
 		{
-			foreach ($fields as $storageField)
-			{
-				$fieldProperties = $storageField->toProperty();
-				$fieldType = $documentService->getFieldTypeObject($documentType, $fieldProperties);
-				if (!$fieldType)
-				{
-					continue;
-				}
+			$formattedValue = array_key_exists($code, $presentedRow)
+				? (string)$presentedRow[$code]
+				: $formatter->format($field[$code] ?? null)
+			;
 
-				$code = $fieldProperties['FieldName'] ?? null;
-				$rawValue = $field[$code] ?? null;
-				$formattedValue = !\CBPHelper::isEmptyValue($rawValue) ? $fieldType->formatValue($rawValue) : '';
-
-				$fieldColumns[strtoupper($code)] = htmlspecialcharsbx($formattedValue);
-			}
+			$fieldColumns[strtoupper($code)] = htmlspecialcharsbx($formattedValue);
 		}
 
 		return $fieldColumns;
+	}
+
+	/**
+	 * @return array<string, FieldValueFormatter> keyed by dynamic field code
+	 */
+	protected function getFieldValueFormatters(): array
+	{
+		if ($this->fieldValueFormatters === null)
+		{
+			$this->fieldValueFormatters = [];
+			foreach ($this->fieldService->getDynamicFields() as $storageField)
+			{
+				$code = (string)$storageField->getCode();
+				$formatter = FieldValueFormatter::forProperty($storageField->toProperty());
+				if ($code !== '' && $formatter !== null)
+				{
+					$this->fieldValueFormatters[$code] = $formatter;
+				}
+			}
+		}
+
+		return $this->fieldValueFormatters;
 	}
 
 	protected function setTitle(string $title): void
@@ -311,6 +350,8 @@ class BizprocStorageItemListComponent extends CBitrixComponent
 			}
 
 			$userNames = $this->getUserNames(array_unique($userIds));
+			FieldValueFormatter::prefetchUsers($fields);
+			$presentedOverlay = $this->getPresentedOverlay($fields);
 
 			foreach ($fields as $key => $field)
 			{
@@ -319,7 +360,7 @@ class BizprocStorageItemListComponent extends CBitrixComponent
 				$grid['ROWS'][] = [
 					'id' => $field['id'],
 					'data' => $field,
-					'columns' => $this->getFieldColumns($fields[$key]),
+					'columns' => $this->getFieldColumns($fields[$key], $presentedOverlay[$key] ?? []),
 				];
 			}
 		}
@@ -410,6 +451,49 @@ class BizprocStorageItemListComponent extends CBitrixComponent
 				],
 			],
 		];
+	}
+
+	/**
+	 * @param array $fields
+	 * @return array<int|string, array<string, string>> overlay of humanized cells, keyed by row key then column code
+	 */
+	protected function getPresentedOverlay(array $fields): array
+	{
+		if (!$this->isDataView || $this->dataViewDefinition === null)
+		{
+			return [];
+		}
+
+		$dynamicCodes = array_map(
+			static fn(\Bitrix\Bizproc\Internal\Entity\StorageField\StorageField $dynamicField): ?string => $dynamicField->getCode(),
+			$this->fieldService->getDynamicFields(),
+		);
+
+		$rowsByCode = [];
+		foreach ($fields as $key => $field)
+		{
+			$row = [];
+			foreach ($dynamicCodes as $code)
+			{
+				if (array_key_exists($code, $field))
+				{
+					$row[$code] = $field[$code];
+				}
+			}
+			$rowsByCode[$key] = $row;
+		}
+
+		try
+		{
+			return ServiceLocator::getInstance()
+				->get('bizproc.service.dataView.valuePresenter')
+				->present($this->dataViewDefinition, $rowsByCode)
+			;
+		}
+		catch (\Throwable)
+		{
+			return [];
+		}
 	}
 
 	protected function getUserNames(array $userIds): array

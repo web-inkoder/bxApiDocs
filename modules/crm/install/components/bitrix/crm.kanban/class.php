@@ -1212,7 +1212,11 @@ class CrmKanbanComponent extends CBitrixComponent
 		$type = (string) $this->request('type');
 		$fields = $this->request('fields');
 
-		return $this->getEntity()->saveAdditionalFields($fields, $type, $this->getKanban()->canEditSettings());
+		$result = $this->getEntity()->saveAdditionalFields($fields, $type, $this->getKanban()->canEditSettings());
+
+		$this->invalidateTotalSumsForCurrentUser();
+
+		return $result;
 	}
 
 	protected function actionDelete(mixed $ids = null): array
@@ -1255,6 +1259,8 @@ class CrmKanbanComponent extends CBitrixComponent
 				'data' => $error->getCustomData(),
 			];
 		}
+
+		$this->invalidateTotalSumsForCurrentUser();
 
 		return $data;
 	}
@@ -1325,6 +1331,8 @@ class CrmKanbanComponent extends CBitrixComponent
 
 		$this->needPrepareColumns = true;
 
+		$this->invalidateTotalSumsForCurrentUser();
+
 		return $result;
 	}
 
@@ -1354,6 +1362,8 @@ class CrmKanbanComponent extends CBitrixComponent
 			CCrmDeal::refreshAccountingData($idForUpdate);
 		}
 
+		// Intentionally no cache invalidation here: this action handles pull events
+		// about changes by other users; staleness is bounded by TotalSumsCache TTL.
 		return [];
 	}
 
@@ -1368,6 +1378,8 @@ class CrmKanbanComponent extends CBitrixComponent
 		}
 
 		$this->getEntity()->setItemsAssigned($ids, $assignedId);
+
+		$this->invalidateTotalSumsForCurrentUser();
 
 		return [];
 	}
@@ -1384,6 +1396,8 @@ class CrmKanbanComponent extends CBitrixComponent
 		$isOpened = ($this->request('flag') === 'Y');
 
 		$this->getEntity()->updateItemsOpened($ids, $isOpened);
+
+		$this->invalidateTotalSumsForCurrentUser();
 
 		return [];
 	}
@@ -1408,6 +1422,8 @@ class CrmKanbanComponent extends CBitrixComponent
 				'ERROR' => reset($errorMessages),
 			];
 		}
+
+		$this->invalidateTotalSumsForCurrentUser();
 
 		return [];
 	}
@@ -1495,6 +1511,24 @@ class CrmKanbanComponent extends CBitrixComponent
 				$this->arResult['DEFAULT_HEADER_SECTION_ID'] = $section['id'];
 			}
 		}
+	}
+
+	private function invalidateTotalSumsForCurrentUser(): void
+	{
+		$userId = (int)\Bitrix\Crm\Service\Container::getInstance()->getContext()->getUserId();
+		if ($userId <= 0)
+		{
+			return;
+		}
+		$cache = \Bitrix\Main\DI\ServiceLocator::getInstance()->get(\Bitrix\Crm\Kanban\TotalSumsCache::class);
+		if (!$cache->isEnabled())
+		{
+			return;
+		}
+		// Invalidate the current user's cache across ALL categories of this entity
+		// type: a write action may affect sums in a category other than the one
+		// currently open. Cheap (per-user) and removes any cross-category staleness.
+		$cache->cleanDir($this->getEntityTypeId(), $userId);
 	}
 
 	private function getStub(): array

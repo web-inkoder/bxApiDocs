@@ -71,7 +71,13 @@ class CBPCrmSetCompanyField extends CBPSetFieldActivity
 				$this->writeDebugInfo($map);
 			}
 
-			$documentService->UpdateDocument($documentId, $fieldValue, $this->ModifiedBy);
+			// Attribute to the workflow starter when no explicit
+			// ModifiedBy. method_exists guards bizproc being older than crm.
+			$modifiedBy = method_exists($this, 'getModifiedByOrStarter')
+				? $this->getModifiedByOrStarter()
+				: $this->ModifiedBy
+			;
+			$documentService->UpdateDocument($documentId, $fieldValue, $modifiedBy);
 
 			$documentTypeForAnalytics = $this->getDocumentType();
 			\CCrmBizProcHelper::sendOperationsAnalytics(

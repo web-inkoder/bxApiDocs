@@ -103,6 +103,7 @@ class CBPCrmCreateDynamicActivity extends \Bitrix\Bizproc\Activity\BaseActivity
 		$errorCollection = parent::internalExecute();
 
 		$fieldsValues = $this->externalizeDocumentFields();
+		$fieldsValues = $this->applyResponsibleFallbackIfNeeded($fieldsValues);
 		$this->logDocumentFields($fieldsValues);
 
 		$documentType = $this->getCreatedDocumentType();
@@ -223,6 +224,45 @@ class CBPCrmCreateDynamicActivity extends \Bitrix\Bizproc\Activity\BaseActivity
 		}
 
 		return $resultFields;
+	}
+
+	protected function applyResponsibleFallbackIfNeeded(array $fieldsValues): array
+	{
+		$responsibleFieldName = Crm\Item::FIELD_NAME_ASSIGNED;
+		if (!\CBPHelper::isEmptyValue($fieldsValues[$responsibleFieldName] ?? null))
+		{
+			return $fieldsValues;
+		}
+
+		$resolvedTargetDocumentId = $this->resolveTargetDocumentId();
+		if (!$this->canReadResolvedTarget($resolvedTargetDocumentId))
+		{
+			return $fieldsValues;
+		}
+
+		return static::applyResponsibleFallback(
+			$fieldsValues,
+			$this->getSourceDocumentResponsibleId($resolvedTargetDocumentId),
+		);
+	}
+
+	private static function applyResponsibleFallback(array $fieldsValues, int $responsibleId): array
+	{
+		$responsibleFieldName = Crm\Item::FIELD_NAME_ASSIGNED;
+		if (
+			$responsibleId > 0
+			&& \CBPHelper::isEmptyValue($fieldsValues[$responsibleFieldName] ?? null)
+		)
+		{
+			$fieldsValues[$responsibleFieldName] = 'user_' . $responsibleId;
+		}
+
+		return $fieldsValues;
+	}
+
+	protected function getSourceDocumentResponsibleId(array $documentId): int
+	{
+		return CCrmBizProcHelper::getDocumentResponsibleId($documentId);
 	}
 
 	private function logDocumentFields(array $fields)

@@ -439,6 +439,7 @@ class CBPWriteDataStorageActivity extends BaseActivity implements IBPConfigurabl
 					],
 				],
 				'Required' => false,
+				'RequiredMark' => true,
 				'AllowSelection' => false,
 			],
 			'StorageCode' => [
@@ -479,10 +480,11 @@ class CBPWriteDataStorageActivity extends BaseActivity implements IBPConfigurabl
 				],
 			],
 			'WriteFields' => [
-				'Name' => '',
+				'Name' => Loc::getMessage('BIZPROC_WRITE_DATA_ACTIVITY_WRITE_FIELDS_PROPERTY'),
 				'FieldName' => 'write_fields',
 				'Type' => FieldType::CUSTOM,
 				'Required' => false,
+				'RequiredMark' => true,
 				'AllowSelection' => true,
 				'CustomType' => 'writeFields',
 				'Options' => [
@@ -684,6 +686,21 @@ class CBPWriteDataStorageActivity extends BaseActivity implements IBPConfigurabl
 					),
 				];
 			}
+		}
+
+		$hasStorage =
+			!CBPHelper::isEmptyValue($arTestProperties['StorageId'] ?? null)
+			|| !CBPHelper::isEmptyValue($arTestProperties['StorageCode'] ?? null)
+		;
+		if (!$hasStorage)
+		{
+			$errors[] = [
+				'code' => 'NotExist',
+				'parameter' => 'StorageId',
+				'message' => Loc::getMessage('BIZPROC_WRITE_DATA_ACTIVITY_EMPTY_STORAGE_ID_OR_CODE'),
+			];
+
+			return $errors;
 		}
 
 		$fields = $arTestProperties['Fields'] ?? [];

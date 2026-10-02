@@ -147,7 +147,11 @@ class MailUserSignatureListComponent extends CBitrixComponent
 			$columns = [
 				'ID' => $dto['id'],
 				'SIGNATURE' => htmlspecialcharsbx(mb_substr(strip_tags($dto['signature']), 0, 100), ENT_COMPAT, false),
-				'ASSIGNED_TO' => $this->formatAssignedTo($dto['scope'], $targetTitles[$dto['id']] ?? []),
+				'ASSIGNED_TO' => $this->formatAssignedTo(
+					$dto['scope'],
+					$targetTitles[$dto['id']] ?? [],
+					$entry['assignments'] !== [],
+				),
 			];
 
 			if ($withServiceColumns)
@@ -238,14 +242,14 @@ class MailUserSignatureListComponent extends CBitrixComponent
 	 *
 	 * @param string[] $targetTitles
 	 */
-	protected function formatAssignedTo(string $scope, array $targetTitles): string
+	protected function formatAssignedTo(string $scope, array $targetTitles, bool $hasAssignments = false): string
 	{
 		if (!empty($targetTitles))
 		{
 			return htmlspecialcharsbx(implode(', ', $targetTitles));
 		}
 
-		return $scope === SharedSignatureTable::SCOPE_OWNER
+		return $scope === SharedSignatureTable::SCOPE_OWNER && !$hasAssignments
 			? htmlspecialcharsbx((string)Loc::getMessage('MAIL_USERSIGNATURE_LIST_DEFAULT'))
 			: htmlspecialcharsbx((string)Loc::getMessage('MAIL_USERSIGNATURE_LIST_ASSIGNED_TO_NOBODY'))
 		;
@@ -698,11 +702,6 @@ class MailUserSignatureListComponent extends CBitrixComponent
 		return SharedSignatureService::isSharedInterfaceEnabled();
 	}
 
-	/**
-	 * Whether the type, the author and the date of change are shown: the tariff and the right to
-	 * manage shared signatures, and the interface gate on top of them — with the shared signatures
-	 * hidden the screen looks exactly like the list of personal ones.
-	 */
 	protected function areServiceColumnsVisible(): bool
 	{
 		return $this->isSharedSignatureInterfaceEnabled() && $this->canManageSharedScope();

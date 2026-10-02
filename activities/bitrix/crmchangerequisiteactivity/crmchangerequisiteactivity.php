@@ -4,12 +4,11 @@ if (!defined('B_PROLOG_INCLUDED') || B_PROLOG_INCLUDED!==true)
 	die();
 }
 
-use \Bitrix\Crm\EntityPreset;
-use \Bitrix\Crm\EntityRequisite;
-use \Bitrix\Crm\EntityBankDetail;
-
-use Bitrix\Crm\Integration\Analytics\Dictionary;
 use Bitrix\Bizproc\Activity\Mixins\ChecksResolvedTargetAccessTrait;
+use Bitrix\Crm\EntityBankDetail;
+use Bitrix\Crm\EntityPreset;
+use Bitrix\Crm\EntityRequisite;
+use Bitrix\Crm\Integration\Analytics\Dictionary;
 
 $runtime = CBPRuntime::GetRuntime();
 $runtime->IncludeActivityFile('CrmGetRequisitesInfoActivity');
@@ -298,18 +297,45 @@ class CBPCrmChangeRequisiteActivity extends CBPCrmGetRequisitesInfoActivity
 			$documentType, $documentService, parent::getPropertiesDialogMap(),
 			$currentValues, $errors
 		);
+		$requisiteFieldsMap = self::getRequisiteFieldsMap();
+		$requisitePresetId = $properties['RequisitePresetId'] ?? null;
+		if (is_numeric($requisitePresetId) && (int)$requisitePresetId > 0)
+		{
+			$countryId = EntityRequisite::getSingleInstance()->getCountryIdByPresetId((int)$requisitePresetId);
+			$requisiteFieldsMap = self::getRequisiteFieldsMap($countryId);
+		}
+
+		$currentActivity = &CBPWorkflowTemplateLoader::FindActivityByName($workflowTemplate, $activityName);
+		$previousFieldsValues = self::normalizeFieldsValues(
+			array_merge(
+				[
+					'RequisiteFields' => [],
+					'BankDetailFields' => [],
+				],
+				(array)($currentActivity['Properties']['FieldsValues'] ?? [])
+			)
+		);
+		$requisiteFieldsValues = array_merge(
+			self::getValues(
+				$documentType, $documentService, array_intersect_key($requisiteFieldsMap, $currentValues),
+				$currentValues, $errors
+			),
+			self::getValues(
+				$documentType, $documentService, array_intersect_key(self::getUserFieldsMap(), $currentValues),
+				$currentValues, $errors
+			)
+		);
+		if (!is_numeric($requisitePresetId) || (int)$requisitePresetId <= 0)
+		{
+			$requisiteFieldsValues = self::preserveUnavailableRqListFieldValues(
+				$requisiteFieldsValues,
+				$previousFieldsValues['RequisiteFields'],
+				$requisiteFieldsMap
+			);
+		}
 
 		$properties['FieldsValues'] = [
-			'RequisiteFields' => array_merge(
-				self::getValues(
-					$documentType, $documentService, array_intersect_key(self::getRequisiteFieldsMap(), $currentValues),
-					$currentValues, $errors
-				),
-				self::getValues(
-					$documentType, $documentService, array_intersect_key(self::getUserFieldsMap(), $currentValues),
-					$currentValues, $errors
-				)
-			),
+			'RequisiteFields' => $requisiteFieldsValues,
 			'BankDetailFields' => self::getValues(
 				$documentType, $documentService, array_intersect_key(self::getBankDetailMap(), $currentValues),
 				$currentValues, $errors
@@ -334,11 +360,28 @@ class CBPCrmChangeRequisiteActivity extends CBPCrmGetRequisitesInfoActivity
 		$isCorrect = (count($errors) <= 0);
 		if($isCorrect)
 		{
-			$arCurrentActivity = &CBPWorkflowTemplateLoader::FindActivityByName($workflowTemplate, $activityName);
-			$arCurrentActivity["Properties"] = $properties;
+			$currentActivity['Properties'] = $properties;
 		}
 
 		return $isCorrect;
+	}
+
+	protected static function preserveUnavailableRqListFieldValues(
+		array $currentValues,
+		array $previousValues,
+		array $availableFieldsMap
+	): array
+	{
+		$rqListFieldsMap = array_fill_keys(
+			EntityRequisite::getSingleInstance()->getRqListFields(),
+			true
+		);
+		$unavailableRqListFieldsMap = array_diff_key($rqListFieldsMap, $availableFieldsMap);
+
+		return array_merge(
+			array_intersect_key($previousValues, $unavailableRqListFieldsMap),
+			$currentValues
+		);
 	}
 
 	protected static function getRequisiteFieldsMap(int $countryId = 0): array
